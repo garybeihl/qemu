@@ -41,6 +41,7 @@
 #include "hw/misc/unimp.h"
 #include "hw/pci-host/aspeed_pcie.h"
 #include "hw/misc/aspeed_peci.h"
+#include "hw/misc/aspeed_espi.h"
 #include "hw/fsi/aspeed_apb2opb.h"
 #include "hw/char/serial-mm.h"
 #include "hw/intc/arm_gicv3.h"
@@ -112,7 +113,7 @@ struct AspeedSoCState {
     UnimplementedDeviceState video;
     UnimplementedDeviceState emmc_boot_controller;
     UnimplementedDeviceState dpmcu;
-    UnimplementedDeviceState espi;
+    AspeedESPIState espi;
     UnimplementedDeviceState udc;
     UnimplementedDeviceState jtag[ASPEED_JTAG_NUM];
     AspeedAPB2OPBState fsi[2];

@@ -82,6 +82,7 @@ static const hwaddr aspeed_soc_ast2600_memmap[] = {
     [ASPEED_DEV_FSI2]      = 0x1E79B100,
     [ASPEED_DEV_I3C]       = 0x1E7A0000,
     [ASPEED_DEV_PCIE_MMIO1] = 0x60000000,
+    [ASPEED_DEV_ESPI]      = 0x1E6EE000,
     [ASPEED_DEV_SDRAM]     = 0x80000000,
 };
 
@@ -142,6 +143,7 @@ static const int aspeed_soc_ast2600_irqmap[] = {
     [ASPEED_DEV_FSI1]      = 100,
     [ASPEED_DEV_FSI2]      = 101,
     [ASPEED_DEV_I3C]       = 102,   /* 102 -> 107 */
+    [ASPEED_DEV_ESPI]      = 42,
 };
 
 static qemu_irq aspeed_soc_ast2600_get_irq(AspeedSoCState *s, int dev)
@@ -200,6 +202,8 @@ static void aspeed_soc_ast2600_init(Object *obj)
                             TYPE_ASPEED_PCIE_PHY);
 
     object_initialize_child(obj, "peci", &s->peci, TYPE_ASPEED_PECI);
+
+    object_initialize_child(obj, "espi", &s->espi, TYPE_ASPEED_ESPI);
 
     snprintf(typename, sizeof(typename), "aspeed.fmc-%s", socname);
     object_initialize_child(obj, "fmc", &s->fmc, typename);
@@ -729,6 +733,15 @@ static void aspeed_soc_ast2600_realize(DeviceState *dev, Error **errp)
     }
     aspeed_mmio_map(s->memory, SYS_BUS_DEVICE(&s->sbc), 0,
                     sc->memmap[ASPEED_DEV_SBC]);
+
+    /* eSPI Controller */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->espi), errp)) {
+        return;
+    }
+    aspeed_mmio_map(s->memory, SYS_BUS_DEVICE(&s->espi), 0,
+                    sc->memmap[ASPEED_DEV_ESPI]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->espi), 0,
+                       aspeed_soc_ast2600_get_irq(s, ASPEED_DEV_ESPI));
 
     /* FSI */
     for (i = 0; i < ASPEED_FSI_NUM; i++) {

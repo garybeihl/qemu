@@ -213,7 +213,8 @@ qtests_npcm7xx = \
 qtests_npcm8xx = \
   ['npcm_gmac-test']
 qtests_aspeed = \
-  ['aspeed_gpio-test',
+  ['aspeed_espi-test',
+   'aspeed_gpio-test',
    'aspeed_hace-test',
    'aspeed_scu-test',
    'aspeed_smc-test']
