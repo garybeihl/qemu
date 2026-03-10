@@ -5,7 +5,9 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Phase 1 implementation: Register skeleton + Virtual Wire channel (CH1).
+ * Phase 1+2 implementation:
+ *   Phase 1: Register skeleton + Virtual Wire channel (CH1)
+ *   Phase 2: Peripheral channel (CH0) FIFO and DMA data paths
  *
  * Implements the AST2600 eSPI controller at register level, sufficient for
  * the OpenBMC aspeed-espi kernel driver to probe and initialize. Supports:
@@ -13,6 +15,10 @@
  *   - Interrupt status (write-1-to-clear) and interrupt enable
  *   - Virtual Wire system events (SYSEVT/SYSEVT1) and GPIO
  *   - Channel capability and configuration reporting
+ *   - Peripheral channel (CH0) FIFO-based TX/RX for posted completions
+ *   - Peripheral channel non-posted TX path
+ *   - DMA transfers between device and guest DRAM
+ *   - Software reset for peripheral channel FIFOs
  *
  * Reference:
  *   - Intel eSPI Base Specification Rev 1.0
@@ -25,8 +31,10 @@
 #include "qemu/bitops.h"
 #include "hw/core/irq.h"
 #include "hw/misc/aspeed_espi.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "trace.h"
+
 
 /* Bits in ESPI_VW_SYSEVT that are read-only from the BMC side (host-driven) */
 #define SYSEVT_HOST_DRIVEN_MASK ( \
@@ -49,6 +57,8 @@
     ESPI_VW_SYSEVT_OOB_RST_ACK    | \
     ESPI_VW_SYSEVT_NMI_OUT        | \
     ESPI_VW_SYSEVT_SMI_OUT)
+
+
 
 static void aspeed_espi_update_irq(AspeedESPIState *s)
 {
@@ -79,10 +89,98 @@ static void aspeed_espi_vw_notify_sysevt(AspeedESPIState *s,
     }
 }
 
+/* ---- Peripheral channel (CH0) helpers ---- */
+
+/*
+ * Build a CTRL register value from cycle type, tag, and length.
+ */
+static inline uint32_t espi_perif_ctrl_pack(uint8_t cyc, uint8_t tag,
+                                             uint32_t len)
+{
+    return ((len & 0xFFF) << ESPI_PERIF_CTRL_LEN_SHIFT) |
+           ((tag & 0xF) << ESPI_PERIF_CTRL_TAG_SHIFT) |
+           (cyc & 0xFF);
+}
+
+/*
+ * Reset a peripheral channel FIFO (called on SW reset bits).
+ */
+static void aspeed_espi_perif_pc_rx_reset(AspeedESPIState *s)
+{
+    memset(s->pc_rx_buf, 0, sizeof(s->pc_rx_buf));
+    s->pc_rx_len = 0;
+    s->pc_rx_pos = 0;
+    s->regs[R_ESPI_PERIF_PC_RX_CTRL] = 0;
+}
+
+static void aspeed_espi_perif_pc_tx_reset(AspeedESPIState *s)
+{
+    memset(s->pc_tx_buf, 0, sizeof(s->pc_tx_buf));
+    s->pc_tx_len = 0;
+    s->regs[R_ESPI_PERIF_PC_TX_CTRL] = 0;
+}
+
+static void aspeed_espi_perif_np_tx_reset(AspeedESPIState *s)
+{
+    memset(s->np_tx_buf, 0, sizeof(s->np_tx_buf));
+    s->np_tx_len = 0;
+    s->regs[R_ESPI_PERIF_NP_TX_CTRL] = 0;
+}
+
+/*
+ * Complete a PC TX operation: transfer data via DMA or FIFO,
+ * clear TRIG_PEND, and raise TX completion interrupt.
+ */
+static void aspeed_espi_perif_pc_tx_complete(AspeedESPIState *s)
+{
+    if (s->regs[R_ESPI_CTRL] & ESPI_CTRL_PERIF_PC_TX_DMA_EN) {
+        /*
+         * DMA mode: data was written to guest DRAM by firmware.
+         * In a full two-sided model the master would read it;
+         * for now we just acknowledge the transfer.
+         */
+    } else {
+        /*
+         * FIFO mode: data is already in pc_tx_buf from DATA writes.
+         * Nothing to transfer in a single-sided model.
+         */
+    }
+
+    /* Clear TRIG_PEND to indicate TX is complete */
+    s->regs[R_ESPI_PERIF_PC_TX_CTRL] &= ~ESPI_PERIF_PC_TX_CTRL_TRIG_PEND;
+
+    /* Reset TX FIFO position for next packet */
+    s->pc_tx_len = 0;
+
+    /* Raise TX completion interrupt */
+    s->regs[R_ESPI_INT_STS] |= ESPI_INT_PERIF_PC_TX_CMPLT;
+    aspeed_espi_update_irq(s);
+}
+
+/*
+ * Complete an NP TX operation: same logic as PC TX.
+ */
+static void aspeed_espi_perif_np_tx_complete(AspeedESPIState *s)
+{
+    if (s->regs[R_ESPI_CTRL] & ESPI_CTRL_PERIF_NP_TX_DMA_EN) {
+        /* DMA mode: acknowledge transfer */
+    } else {
+        /* FIFO mode: data already in np_tx_buf */
+    }
+
+    s->regs[R_ESPI_PERIF_NP_TX_CTRL] &= ~ESPI_PERIF_NP_TX_CTRL_TRIG_PEND;
+    s->np_tx_len = 0;
+
+    s->regs[R_ESPI_INT_STS] |= ESPI_INT_PERIF_NP_TX_CMPLT;
+    aspeed_espi_update_irq(s);
+}
+
+
 static uint64_t aspeed_espi_read(void *opaque, hwaddr offset, unsigned size)
 {
     AspeedESPIState *s = ASPEED_ESPI(opaque);
     uint32_t reg = offset >> 2;
+    uint8_t byte_val;
 
     if (reg >= ASPEED_ESPI_NR_REGS) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -91,7 +189,24 @@ static uint64_t aspeed_espi_read(void *opaque, hwaddr offset, unsigned size)
         return 0;
     }
 
-    return s->regs[reg];
+    switch (reg) {
+    case R_ESPI_PERIF_PC_RX_DATA:
+        /*
+         * FIFO mode: return next byte from RX buffer.
+         * DMA mode: data is in guest DRAM, register reads return 0.
+         */
+        if (s->regs[R_ESPI_CTRL] & ESPI_CTRL_PERIF_PC_RX_DMA_EN) {
+            return 0;
+        }
+        if (s->pc_rx_pos < s->pc_rx_len) {
+            byte_val = s->pc_rx_buf[s->pc_rx_pos++];
+            return byte_val;
+        }
+        return 0;
+
+    default:
+        return s->regs[reg];
+    }
 }
 
 static void aspeed_espi_write(void *opaque, hwaddr offset, uint64_t data,
@@ -113,7 +228,17 @@ static void aspeed_espi_write(void *opaque, hwaddr offset, uint64_t data,
         /*
          * SW reset bits are self-clearing. Store the rest
          * (ready bits, DMA enables, SAFS mode, etc).
+         * Execute peripheral channel FIFO resets before clearing bits.
          */
+        if (data & ESPI_CTRL_PERIF_PC_RX_SW_RST) {
+            aspeed_espi_perif_pc_rx_reset(s);
+        }
+        if (data & ESPI_CTRL_PERIF_PC_TX_SW_RST) {
+            aspeed_espi_perif_pc_tx_reset(s);
+        }
+        if (data & ESPI_CTRL_PERIF_NP_TX_SW_RST) {
+            aspeed_espi_perif_np_tx_reset(s);
+        }
         s->regs[R_ESPI_CTRL] = data & ~(
             ESPI_CTRL_FLASH_TX_SW_RST |
             ESPI_CTRL_FLASH_RX_SW_RST |
@@ -202,6 +327,71 @@ static void aspeed_espi_write(void *opaque, hwaddr offset, uint64_t data,
         aspeed_espi_update_irq(s);
         break;
 
+    case R_ESPI_PERIF_PC_RX_DMA:
+    case R_ESPI_PERIF_PC_TX_DMA:
+    case R_ESPI_PERIF_NP_TX_DMA:
+        /* DMA address registers: store the guest physical address */
+        s->regs[reg] = (uint32_t)data;
+        break;
+
+    case R_ESPI_PERIF_PC_RX_CTRL:
+        /*
+         * BMC writes SERV_PEND to acknowledge receipt of a packet.
+         * This clears the pending flag and resets the RX FIFO position.
+         */
+        if (data & ESPI_PERIF_PC_RX_CTRL_SERV_PEND) {
+            s->regs[R_ESPI_PERIF_PC_RX_CTRL] &=
+                ~ESPI_PERIF_PC_RX_CTRL_SERV_PEND;
+            s->pc_rx_pos = 0;
+            s->pc_rx_len = 0;
+        }
+        break;
+
+    case R_ESPI_PERIF_PC_TX_CTRL:
+        /*
+         * BMC writes CYC|TAG|LEN|TRIG_PEND to trigger a TX.
+         * Store the control word, then if TRIG_PEND is set,
+         * complete the transmission.
+         */
+        s->regs[R_ESPI_PERIF_PC_TX_CTRL] = (uint32_t)data;
+        if (data & ESPI_PERIF_PC_TX_CTRL_TRIG_PEND) {
+            aspeed_espi_perif_pc_tx_complete(s);
+        }
+        break;
+
+    case R_ESPI_PERIF_NP_TX_CTRL:
+        s->regs[R_ESPI_PERIF_NP_TX_CTRL] = (uint32_t)data;
+        if (data & ESPI_PERIF_NP_TX_CTRL_TRIG_PEND) {
+            aspeed_espi_perif_np_tx_complete(s);
+        }
+        break;
+
+    case R_ESPI_PERIF_PC_RX_DATA:
+        /* RX DATA is read-only from BMC side */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: Write to read-only RX DATA register\n", __func__);
+        break;
+
+    case R_ESPI_PERIF_PC_TX_DATA:
+        /*
+         * FIFO mode: BMC pushes bytes into TX buffer.
+         * DMA mode: writes are ignored (data comes from DRAM).
+         */
+        if (!(s->regs[R_ESPI_CTRL] & ESPI_CTRL_PERIF_PC_TX_DMA_EN)) {
+            if (s->pc_tx_len < ASPEED_ESPI_PERIF_FIFO_SIZE) {
+                s->pc_tx_buf[s->pc_tx_len++] = (uint8_t)data;
+            }
+        }
+        break;
+
+    case R_ESPI_PERIF_NP_TX_DATA:
+        if (!(s->regs[R_ESPI_CTRL] & ESPI_CTRL_PERIF_NP_TX_DMA_EN)) {
+            if (s->np_tx_len < ASPEED_ESPI_PERIF_FIFO_SIZE) {
+                s->np_tx_buf[s->np_tx_len++] = (uint8_t)data;
+            }
+        }
+        break;
+
     case R_ESPI_GEN_CAP_N_CONF:
     case R_ESPI_CH0_CAP_N_CONF:
     case R_ESPI_CH1_CAP_N_CONF:
@@ -245,6 +435,12 @@ static void aspeed_espi_realize(DeviceState *dev, Error **errp)
                           TYPE_ASPEED_ESPI, 0x1000);
     sysbus_init_mmio(sbd, &s->mmio);
     sysbus_init_irq(sbd, &s->irq);
+
+    /* Set up DMA address space for peripheral channel transfers */
+    if (s->dram_mr) {
+        address_space_init(&s->dma_as, s->dram_mr,
+                           TYPE_ASPEED_ESPI ".dma");
+    }
 }
 
 static void aspeed_espi_reset(DeviceState *dev)
@@ -275,16 +471,36 @@ static void aspeed_espi_reset(DeviceState *dev)
      * link is up. The driver checks this during probe.
      */
     s->regs[R_ESPI_INT_STS] = ESPI_INT_RST_DEASSERT;
+
+    /* Reset peripheral channel FIFO state */
+    aspeed_espi_perif_pc_rx_reset(s);
+    aspeed_espi_perif_pc_tx_reset(s);
+    aspeed_espi_perif_np_tx_reset(s);
 }
 
 static const VMStateDescription vmstate_aspeed_espi = {
     .name = TYPE_ASPEED_ESPI,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, AspeedESPIState, ASPEED_ESPI_NR_REGS),
+        VMSTATE_UINT8_ARRAY(pc_rx_buf, AspeedESPIState,
+                            ASPEED_ESPI_PERIF_FIFO_SIZE),
+        VMSTATE_UINT32(pc_rx_len, AspeedESPIState),
+        VMSTATE_UINT32(pc_rx_pos, AspeedESPIState),
+        VMSTATE_UINT8_ARRAY(pc_tx_buf, AspeedESPIState,
+                            ASPEED_ESPI_PERIF_FIFO_SIZE),
+        VMSTATE_UINT32(pc_tx_len, AspeedESPIState),
+        VMSTATE_UINT8_ARRAY(np_tx_buf, AspeedESPIState,
+                            ASPEED_ESPI_PERIF_FIFO_SIZE),
+        VMSTATE_UINT32(np_tx_len, AspeedESPIState),
         VMSTATE_END_OF_LIST(),
     },
+};
+
+static const Property aspeed_espi_properties[] = {
+    DEFINE_PROP_LINK("dram", AspeedESPIState, dram_mr,
+                     TYPE_MEMORY_REGION, MemoryRegion *),
 };
 
 static void aspeed_espi_class_init(ObjectClass *klass, const void *data)
@@ -295,6 +511,7 @@ static void aspeed_espi_class_init(ObjectClass *klass, const void *data)
     device_class_set_legacy_reset(dc, aspeed_espi_reset);
     dc->vmsd    = &vmstate_aspeed_espi;
     dc->desc    = "Aspeed AST2600 eSPI Controller";
+    device_class_set_props(dc, aspeed_espi_properties);
 }
 
 static const TypeInfo aspeed_espi_types[] = {
@@ -306,5 +523,55 @@ static const TypeInfo aspeed_espi_types[] = {
         .abstract      = false,
     },
 };
+
+/*
+ * Inject a posted completion RX packet into the peripheral channel.
+ * This simulates a host-to-BMC transaction arriving over the eSPI bus.
+ *
+ * In FIFO mode, data is placed in the internal RX buffer.
+ * In DMA mode, data is written directly to guest DRAM at the
+ * address specified in PERIF_PC_RX_DMA.
+ */
+void aspeed_espi_perif_pc_rx_inject(AspeedESPIState *s, uint8_t cyc,
+                                     uint8_t tag, const uint8_t *data,
+                                     uint32_t len)
+{
+    uint32_t i;
+
+    if (len > ASPEED_ESPI_PERIF_FIFO_SIZE) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: Packet too large (%u > %u)\n",
+                      __func__, len, ASPEED_ESPI_PERIF_FIFO_SIZE);
+        len = ASPEED_ESPI_PERIF_FIFO_SIZE;
+    }
+
+    if (s->regs[R_ESPI_CTRL] & ESPI_CTRL_PERIF_PC_RX_DMA_EN) {
+        /* DMA mode: write data to guest DRAM */
+        if (s->dram_mr) {
+            uint32_t dma_addr = s->regs[R_ESPI_PERIF_PC_RX_DMA];
+            for (i = 0; i < len; i++) {
+                address_space_stb(&s->dma_as,
+                                  dma_addr + i,
+                                  data[i],
+                                  MEMTXATTRS_UNSPECIFIED,
+                                  NULL);
+            }
+        }
+    } else {
+        /* FIFO mode: copy data into RX buffer */
+        memcpy(s->pc_rx_buf, data, len);
+        s->pc_rx_len = len;
+        s->pc_rx_pos = 0;
+    }
+
+    /* Set CTRL with packet header and SERV_PEND flag */
+    s->regs[R_ESPI_PERIF_PC_RX_CTRL] =
+        ESPI_PERIF_PC_RX_CTRL_SERV_PEND |
+        espi_perif_ctrl_pack(cyc, tag, len);
+
+    /* Raise RX completion interrupt */
+    s->regs[R_ESPI_INT_STS] |= ESPI_INT_PERIF_PC_RX_CMPLT;
+    aspeed_espi_update_irq(s);
+}
 
 DEFINE_TYPES(aspeed_espi_types)

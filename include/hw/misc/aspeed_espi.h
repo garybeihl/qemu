@@ -22,6 +22,9 @@
  */
 #define ASPEED_ESPI_NR_REGS     (0x900 >> 2)
 
+/* Maximum payload size for peripheral channel FIFO (bytes) */
+#define ASPEED_ESPI_PERIF_FIFO_SIZE  256
+
 #define TYPE_ASPEED_ESPI "aspeed.espi"
 OBJECT_DECLARE_SIMPLE_TYPE(AspeedESPIState, ASPEED_ESPI)
 
@@ -34,6 +37,21 @@ struct AspeedESPIState {
     qemu_irq irq;
 
     uint32_t regs[ASPEED_ESPI_NR_REGS];
+
+    /* Peripheral channel (CH0) FIFO buffers */
+    uint8_t  pc_rx_buf[ASPEED_ESPI_PERIF_FIFO_SIZE];
+    uint32_t pc_rx_len;
+    uint32_t pc_rx_pos;
+
+    uint8_t  pc_tx_buf[ASPEED_ESPI_PERIF_FIFO_SIZE];
+    uint32_t pc_tx_len;
+
+    uint8_t  np_tx_buf[ASPEED_ESPI_PERIF_FIFO_SIZE];
+    uint32_t np_tx_len;
+
+    /* DMA support */
+    AddressSpace dma_as;
+    MemoryRegion *dram_mr;
 };
 
 /* eSPI register offsets (from ast2600-espi.h in Aspeed Linux driver) */
@@ -54,6 +72,20 @@ struct AspeedESPIState {
 #define R_ESPI_PERIF_NP_TX_DMA  (0x030 / 4)
 #define R_ESPI_PERIF_NP_TX_CTRL (0x034 / 4)
 #define R_ESPI_PERIF_NP_TX_DATA (0x038 / 4)
+
+
+/* Peripheral channel CTRL register bit definitions */
+#define ESPI_PERIF_PC_RX_CTRL_SERV_PEND   BIT(31)
+#define ESPI_PERIF_PC_TX_CTRL_TRIG_PEND   BIT(31)
+#define ESPI_PERIF_NP_TX_CTRL_TRIG_PEND   BIT(31)
+
+/* CTRL register field masks and shifts */
+#define ESPI_PERIF_CTRL_LEN_MASK     0x00FFF000
+#define ESPI_PERIF_CTRL_LEN_SHIFT    12
+#define ESPI_PERIF_CTRL_TAG_MASK     0x00000F00
+#define ESPI_PERIF_CTRL_TAG_SHIFT    8
+#define ESPI_PERIF_CTRL_CYC_MASK     0x000000FF
+#define ESPI_PERIF_CTRL_CYC_SHIFT    0
 
 /* OOB channel (CH2) - Phase 3 */
 #define R_ESPI_OOB_RX_DMA      (0x040 / 4)
@@ -198,5 +230,13 @@ struct AspeedESPIState {
 #define ESPI_CH2_CAP_N_CONF_RESET       0x00000033
 #define ESPI_CH3_CAP_N_CONF_RESET       0x00000003
 #define ESPI_CH3_CAP_N_CONF2_RESET      0x00000000
+
+/*
+ * Inject a peripheral channel RX packet (simulates host-to-BMC traffic).
+ * Used by QTest and potentially by a future host-side eSPI master model.
+ */
+void aspeed_espi_perif_pc_rx_inject(AspeedESPIState *s, uint8_t cyc,
+                                     uint8_t tag, const uint8_t *data,
+                                     uint32_t len);
 
 #endif /* ASPEED_ESPI_H */

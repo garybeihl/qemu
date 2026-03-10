@@ -735,6 +735,8 @@ static void aspeed_soc_ast2600_realize(DeviceState *dev, Error **errp)
                     sc->memmap[ASPEED_DEV_SBC]);
 
     /* eSPI Controller */
+    object_property_set_link(OBJECT(&s->espi), "dram", OBJECT(s->dram_mr),
+                             &error_abort);
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->espi), errp)) {
         return;
     }
