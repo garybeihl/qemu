@@ -79,6 +79,23 @@
 #define ESPI_CTRL_FLASH_TX_SW_RST  (1u << 31)
 #define ESPI_CTRL_FLASH_RX_SW_RST  (1u << 30)
 
+
+/* MMBI register offsets - Phase 5 */
+#define ESPI_CTRL2              0x080
+#define ESPI_PERIF_MCYC_SADDR  0x084
+#define ESPI_PERIF_MCYC_TADDR  0x088
+#define ESPI_PERIF_MCYC_MASK   0x08C
+#define ESPI_MMBI_CTRL          0x800
+#define ESPI_MMBI_INT_STS       0x808
+#define ESPI_MMBI_INT_EN        0x80C
+#define ESPI_MMBI_HOST_RWP0     0x810
+
+/* MMBI_CTRL bits */
+#define ESPI_MMBI_CTRL_EN       (1u << 0)
+
+/* CTRL2 bits */
+#define ESPI_CTRL2_MCYC_RD_DIS (1u << 6)
+#define ESPI_CTRL2_MCYC_WR_DIS (1u << 4)
 /* Flash interrupt bits */
 #define ESPI_INT_FLASH_TX_CMPLT (1u << 7)
 #define ESPI_INT_FLASH_RX_CMPLT (1u << 6)
@@ -662,6 +679,153 @@ static void test_espi_flash_tx_ctrl_trigger(void)
     qtest_quit(s);
 }
 
+/*
+ * ---- Phase 5: MMBI (Memory-Mapped BMC Interface) Tests ----
+ */
+
+/*
+ * Test: MMBI_CTRL register is read-write and default is 0 (disabled)
+ */
+static void test_espi_mmbi_ctrl(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    /* Default: MMBI disabled */
+    val = qtest_readl(s, ESPI_BASE + ESPI_MMBI_CTRL);
+    g_assert_cmphex(val, ==, 0x00000000);
+
+    /* Enable MMBI with instance size = 8KB (0), total size = 8KB (0) */
+    qtest_writel(s, ESPI_BASE + ESPI_MMBI_CTRL, ESPI_MMBI_CTRL_EN);
+    val = qtest_readl(s, ESPI_BASE + ESPI_MMBI_CTRL);
+    g_assert_cmphex(val & ESPI_MMBI_CTRL_EN, !=, 0);
+
+    /* Write full config: inst_sz=1 (16KB), total_sz=2 (32KB), enable */
+    qtest_writel(s, ESPI_BASE + ESPI_MMBI_CTRL, (1 << 8) | (2 << 4) | 1);
+    val = qtest_readl(s, ESPI_BASE + ESPI_MMBI_CTRL);
+    g_assert_cmphex(val, ==, (1 << 8) | (2 << 4) | 1);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: MMBI_INT_STS is write-1-to-clear
+ */
+static void test_espi_mmbi_int_sts_w1c(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    /* INT_STS should start at 0 */
+    val = qtest_readl(s, ESPI_BASE + ESPI_MMBI_INT_STS);
+    g_assert_cmphex(val, ==, 0x00000000);
+
+    /* Writing 0 should have no effect */
+    qtest_writel(s, ESPI_BASE + ESPI_MMBI_INT_STS, 0x00000000);
+    val = qtest_readl(s, ESPI_BASE + ESPI_MMBI_INT_STS);
+    g_assert_cmphex(val, ==, 0x00000000);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: MMBI_INT_EN is read-write
+ */
+static void test_espi_mmbi_int_en(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    val = qtest_readl(s, ESPI_BASE + ESPI_MMBI_INT_EN);
+    g_assert_cmphex(val, ==, 0x00000000);
+
+    qtest_writel(s, ESPI_BASE + ESPI_MMBI_INT_EN, 0x000000FF);
+    val = qtest_readl(s, ESPI_BASE + ESPI_MMBI_INT_EN);
+    g_assert_cmphex(val, ==, 0x000000FF);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: MMBI host RW pointer register is read-write
+ */
+static void test_espi_mmbi_host_rwp(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    /* Instance 0 RWP at 0x810 */
+    qtest_writel(s, ESPI_BASE + ESPI_MMBI_HOST_RWP0, 0x12345678);
+    val = qtest_readl(s, ESPI_BASE + ESPI_MMBI_HOST_RWP0);
+    g_assert_cmphex(val, ==, 0x12345678);
+
+    /* Instance 1 RWP at 0x818 */
+    qtest_writel(s, ESPI_BASE + ESPI_MMBI_HOST_RWP0 + 8, 0xABCD0000);
+    val = qtest_readl(s, ESPI_BASE + ESPI_MMBI_HOST_RWP0 + 8);
+    g_assert_cmphex(val, ==, 0xABCD0000);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: CTRL2 defaults to MMBI read/write disabled
+ */
+static void test_espi_ctrl2_default(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    val = qtest_readl(s, ESPI_BASE + ESPI_CTRL2);
+    /* Bits 6 (RD_DIS) and 4 (WR_DIS) should be set */
+    g_assert_cmphex(val & ESPI_CTRL2_MCYC_RD_DIS, !=, 0);
+    g_assert_cmphex(val & ESPI_CTRL2_MCYC_WR_DIS, !=, 0);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: CTRL2 can enable MMBI by clearing disable bits
+ */
+static void test_espi_ctrl2_mmbi_enable(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    /* Clear MMBI disable bits to enable memory cycles */
+    qtest_writel(s, ESPI_BASE + ESPI_CTRL2, 0x00000000);
+    val = qtest_readl(s, ESPI_BASE + ESPI_CTRL2);
+    g_assert_cmphex(val & ESPI_CTRL2_MCYC_RD_DIS, ==, 0);
+    g_assert_cmphex(val & ESPI_CTRL2_MCYC_WR_DIS, ==, 0);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: Memory cycle address mapping registers are read-write
+ */
+static void test_espi_mcyc_addr_regs(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    /* Source address */
+    qtest_writel(s, ESPI_BASE + ESPI_PERIF_MCYC_SADDR, 0x80000000);
+    val = qtest_readl(s, ESPI_BASE + ESPI_PERIF_MCYC_SADDR);
+    g_assert_cmphex(val, ==, 0x80000000);
+
+    /* Target address */
+    qtest_writel(s, ESPI_BASE + ESPI_PERIF_MCYC_TADDR, 0x90000000);
+    val = qtest_readl(s, ESPI_BASE + ESPI_PERIF_MCYC_TADDR);
+    g_assert_cmphex(val, ==, 0x90000000);
+
+    /* Address mask */
+    qtest_writel(s, ESPI_BASE + ESPI_PERIF_MCYC_MASK, 0xFFF00000);
+    val = qtest_readl(s, ESPI_BASE + ESPI_PERIF_MCYC_MASK);
+    g_assert_cmphex(val, ==, 0xFFF00000);
+
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -704,5 +868,14 @@ int main(int argc, char **argv)
                    test_espi_flash_rx_data_readonly);
     qtest_add_func("/aspeed-espi/flash-tx-ctrl-trigger",
                    test_espi_flash_tx_ctrl_trigger);
+
+    /* Phase 5: MMBI */
+    qtest_add_func("/aspeed-espi/mmbi-ctrl", test_espi_mmbi_ctrl);
+    qtest_add_func("/aspeed-espi/mmbi-int-sts-w1c", test_espi_mmbi_int_sts_w1c);
+    qtest_add_func("/aspeed-espi/mmbi-int-en", test_espi_mmbi_int_en);
+    qtest_add_func("/aspeed-espi/mmbi-host-rwp", test_espi_mmbi_host_rwp);
+    qtest_add_func("/aspeed-espi/ctrl2-default", test_espi_ctrl2_default);
+    qtest_add_func("/aspeed-espi/ctrl2-mmbi-enable", test_espi_ctrl2_mmbi_enable);
+    qtest_add_func("/aspeed-espi/mcyc-addr-regs", test_espi_mcyc_addr_regs);
     return g_test_run();
 }

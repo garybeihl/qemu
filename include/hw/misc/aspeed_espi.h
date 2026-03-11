@@ -141,6 +141,30 @@ struct AspeedESPIState {
 #define R_ESPI_OOB_TX_CTRL     (0x054 / 4)
 #define R_ESPI_OOB_TX_DATA     (0x058 / 4)
 
+
+/* MMBI (Memory-Mapped BMC Interface) registers - Phase 5 */
+#define R_ESPI_MMBI_CTRL        (0x800 / 4)
+#define R_ESPI_MMBI_INT_STS     (0x808 / 4)
+#define R_ESPI_MMBI_INT_EN      (0x80C / 4)
+/* Per-instance host RW pointers: 0x810 + (instance * 8) */
+#define R_ESPI_MMBI_HOST_RWP(x) ((0x810 + ((x) * 8)) / 4)
+
+/* MMBI_CTRL bit definitions */
+#define ESPI_MMBI_CTRL_EN               BIT(0)
+#define ESPI_MMBI_CTRL_TOTAL_SZ_MASK    GENMASK(6, 4)
+#define ESPI_MMBI_CTRL_TOTAL_SZ_SHIFT   4
+#define ESPI_MMBI_CTRL_INST_SZ_MASK     GENMASK(10, 8)
+#define ESPI_MMBI_CTRL_INST_SZ_SHIFT    8
+
+/* CTRL2 register MMBI-related bits */
+#define ESPI_CTRL2_VW_TX_SORT           BIT(30)
+#define ESPI_CTRL2_MCYC_RD_DIS_WDT     BIT(11)
+#define ESPI_CTRL2_MCYC_WR_DIS_WDT     BIT(10)
+#define ESPI_CTRL2_MCYC_RD_DIS         BIT(6)
+#define ESPI_CTRL2_MCYC_WR_DIS         BIT(4)
+
+/* Maximum MMBI instances (up to 8 per register space) */
+#define ASPEED_ESPI_MMBI_MAX_INST       8
 /* Flash channel (CH3) - Phase 4 */
 #define R_ESPI_FLASH_RX_DMA    (0x060 / 4)
 #define R_ESPI_FLASH_RX_CTRL   (0x064 / 4)
@@ -155,6 +179,11 @@ struct AspeedESPIState {
 #define R_ESPI_PERIF_MCYC_TADDR (0x088 / 4)
 #define R_ESPI_PERIF_MCYC_MASK  (0x08C / 4)
 #define R_ESPI_FLASH_SAFS_TADDR (0x090 / 4)
+
+/* MMBI address mapping (aliases for peripheral memory cycle registers) */
+#define R_ESPI_PERIF_MMBI_SADDR R_ESPI_PERIF_MCYC_SADDR
+#define R_ESPI_PERIF_MMBI_TADDR R_ESPI_PERIF_MCYC_TADDR
+#define R_ESPI_PERIF_MMBI_MASK  R_ESPI_PERIF_MCYC_MASK
 
 /* Virtual Wire channel (CH1) - Phase 1 */
 #define R_ESPI_VW_SYSEVT_INT_EN (0x094 / 4)

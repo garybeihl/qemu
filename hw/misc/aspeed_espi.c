@@ -5,11 +5,12 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Phases 1-4 implementation:
+ * Phases 1-5 implementation:
  *   Phase 1: Register skeleton + Virtual Wire channel (CH1)
  *   Phase 2: Peripheral channel (CH0) FIFO and DMA data paths
  *   Phase 3: OOB channel (CH2) FIFO and DMA data paths
  *   Phase 4: Flash channel (CH3) FIFO and DMA data paths
+ *   Phase 5: MMBI (Memory-Mapped BMC Interface) registers
  *
  * Implements the AST2600 eSPI controller at register level, sufficient for
  * the OpenBMC aspeed-espi kernel driver to probe and initialize. Supports:
@@ -22,6 +23,8 @@
  *   - OOB channel (CH2) FIFO-based TX/RX for out-of-band messages
  *   - Flash channel (CH3) FIFO-based TX/RX for flash access
  *   - DMA transfers between device and guest DRAM
+ *   - MMBI control, interrupt status/enable, and host RW pointer registers
+ *   - CTRL2 with MMBI read/write disable and memory cycle address mapping
  *   - Software reset for peripheral, OOB, and Flash channel FIFOs
  *
  * Reference:
@@ -553,6 +556,29 @@ static void aspeed_espi_write(void *opaque, hwaddr offset, uint64_t data,
         }
         break;
 
+    /* CTRL2 and memory cycle address mapping registers */
+    case R_ESPI_CTRL2:
+    case R_ESPI_PERIF_MCYC_SADDR:
+    case R_ESPI_PERIF_MCYC_TADDR:
+    case R_ESPI_PERIF_MCYC_MASK:
+    case R_ESPI_FLASH_SAFS_TADDR:
+        s->regs[reg] = (uint32_t)data;
+        break;
+
+    /* MMBI registers (Phase 5) */
+    case R_ESPI_MMBI_CTRL:
+        s->regs[R_ESPI_MMBI_CTRL] = (uint32_t)data;
+        break;
+
+    case R_ESPI_MMBI_INT_STS:
+        /* Write-1-to-clear */
+        s->regs[R_ESPI_MMBI_INT_STS] &= ~(uint32_t)data;
+        break;
+
+    case R_ESPI_MMBI_INT_EN:
+        s->regs[R_ESPI_MMBI_INT_EN] = (uint32_t)data;
+        break;
+
     /* Flash channel (CH3) registers */
     case R_ESPI_FLASH_RX_DMA:
     case R_ESPI_FLASH_TX_DMA:
@@ -681,6 +707,17 @@ static void aspeed_espi_reset(DeviceState *dev)
     /* Reset Flash channel FIFO state */
     aspeed_espi_flash_rx_reset(s);
     aspeed_espi_flash_tx_reset(s);
+
+    /* Reset MMBI registers */
+    s->regs[R_ESPI_MMBI_CTRL] = 0;
+    s->regs[R_ESPI_MMBI_INT_STS] = 0;
+    s->regs[R_ESPI_MMBI_INT_EN] = 0;
+
+    /*
+     * CTRL2: MMBI read/write disabled by default.
+     * Firmware enables MMBI by clearing the disable bits.
+     */
+    s->regs[R_ESPI_CTRL2] = ESPI_CTRL2_MCYC_RD_DIS | ESPI_CTRL2_MCYC_WR_DIS;
 }
 
 static const VMStateDescription vmstate_aspeed_espi = {
