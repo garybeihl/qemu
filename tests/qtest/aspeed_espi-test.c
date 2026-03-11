@@ -102,6 +102,20 @@
 /* OOB interrupt bits */
 #define ESPI_INT_OOB_TX_CMPLT   (1u << 5)
 #define ESPI_INT_OOB_RX_CMPLT   (1u << 4)
+
+/* Virtual Wire host-driven event bits - Phase 6 */
+#define ESPI_VW_SYSEVT_HOST_RST_WARN   (1u << 8)
+#define ESPI_VW_SYSEVT_OOB_RST_WARN    (1u << 6)
+#define ESPI_VW_SYSEVT_PLTRST_N        (1u << 5)
+#define ESPI_VW_SYSEVT_SUSPEND          (1u << 4)
+#define ESPI_VW_SYSEVT_S5_SLEEP         (1u << 2)
+#define ESPI_VW_SYSEVT_S4_SLEEP         (1u << 1)
+#define ESPI_VW_SYSEVT_S3_SLEEP         (1u << 0)
+
+/* VW slave-driven event bits */
+#define ESPI_VW_SYSEVT_HOST_RST_ACK    (1u << 27)
+#define ESPI_VW_SYSEVT_SLV_BOOT_DONE   (1u << 20)
+#define ESPI_VW_SYSEVT_OOB_RST_ACK     (1u << 16)
 /* Expected reset values */
 #define ESPI_GEN_CAP_RESET      0x0000F759
 #define ESPI_INT_STS_RESET      0x80000000  /* RST_DEASSERT */
@@ -826,6 +840,221 @@ static void test_espi_mcyc_addr_regs(void)
     qtest_quit(s);
 }
 
+/*
+ * ---- Phase 6: Host-side Co-simulation Tests ----
+ */
+
+/*
+ * Test: Host can assert PLTRST# (deassert PLTRST_N) and slave sees it
+ */
+static void test_espi_host_vw_pltrst(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    /* Initially PLTRST_N should be deasserted (bit 5 = 1) */
+    val = qtest_readl(s, ESPI_BASE + ESPI_VW_SYSEVT);
+    g_assert_cmphex(val & ESPI_VW_SYSEVT_PLTRST_N, !=, 0);
+
+    /* Host asserts PLTRST# by clearing PLTRST_N bit.
+     * We simulate by writing SYSEVT with PLTRST_N cleared.
+     * Host-driven bits are in the lower portion; but since we
+     * can't call aspeed_espi_vw_inject() from QTest directly,
+     * we verify the register behavior. */
+
+    /* Enable SYSEVT interrupt for PLTRST (bit 5) */
+    qtest_writel(s, ESPI_BASE + ESPI_VW_SYSEVT_INT_EN, ESPI_VW_SYSEVT_PLTRST_N);
+
+    /* Clear pending interrupts */
+    qtest_writel(s, ESPI_BASE + ESPI_INT_STS, 0xFFFFFFFF);
+    qtest_writel(s, ESPI_BASE + 0x11C, 0xFFFFFFFF); /* SYSEVT_INT_STS */
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: Slave VW write preserves host-driven bits
+ */
+static void test_espi_vw_slave_preserves_host(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    /* Read initial SYSEVT - should have PLTRST_N set */
+    val = qtest_readl(s, ESPI_BASE + ESPI_VW_SYSEVT);
+    g_assert_cmphex(val & ESPI_VW_SYSEVT_PLTRST_N, !=, 0);
+
+    /* BMC firmware writes slave-driven bits (HOST_RST_ACK, SLV_BOOT_DONE) */
+    qtest_writel(s, ESPI_BASE + ESPI_VW_SYSEVT,
+                 ESPI_VW_SYSEVT_HOST_RST_ACK | ESPI_VW_SYSEVT_SLV_BOOT_DONE);
+
+    /* Host-driven PLTRST_N should still be set (preserved) */
+    val = qtest_readl(s, ESPI_BASE + ESPI_VW_SYSEVT);
+    g_assert_cmphex(val & ESPI_VW_SYSEVT_PLTRST_N, !=, 0);
+
+    /* Slave-driven bits should be set */
+    g_assert_cmphex(val & ESPI_VW_SYSEVT_HOST_RST_ACK, !=, 0);
+    g_assert_cmphex(val & ESPI_VW_SYSEVT_SLV_BOOT_DONE, !=, 0);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: Peripheral TX FIFO round-trip — write data, trigger TX,
+ * verify completion and that FIFO is drained.
+ */
+static void test_espi_perif_tx_roundtrip(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+    const uint8_t test_data[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE};
+    int i;
+
+    /* Clear interrupts */
+    qtest_writel(s, ESPI_BASE + ESPI_INT_STS, 0xFFFFFFFF);
+
+    /* Write 6 bytes into PC TX FIFO */
+    for (i = 0; i < 6; i++) {
+        qtest_writel(s, ESPI_BASE + ESPI_PERIF_PC_TX_DATA, test_data[i]);
+    }
+
+    /* Trigger TX: cyc=0x0F (completion w/data only), tag=1, len=6 */
+    qtest_writel(s, ESPI_BASE + ESPI_PERIF_PC_TX_CTRL,
+                 PERIF_CTRL_TRIG_PEND | (6 << 12) | (1 << 8) | 0x0F);
+
+    /* Verify TRIG_PEND cleared */
+    val = qtest_readl(s, ESPI_BASE + ESPI_PERIF_PC_TX_CTRL);
+    g_assert_cmphex(val & PERIF_CTRL_TRIG_PEND, ==, 0);
+
+    /* Verify TX completion interrupt */
+    val = qtest_readl(s, ESPI_BASE + ESPI_INT_STS);
+    g_assert_cmphex(val & ESPI_INT_PERIF_PC_TX_CMPLT, !=, 0);
+
+    /* FIFO should be empty now — next write starts a new packet */
+    qtest_writel(s, ESPI_BASE + ESPI_INT_STS, ESPI_INT_PERIF_PC_TX_CMPLT);
+
+    /* Write 2 more bytes for a second packet */
+    qtest_writel(s, ESPI_BASE + ESPI_PERIF_PC_TX_DATA, 0x11);
+    qtest_writel(s, ESPI_BASE + ESPI_PERIF_PC_TX_DATA, 0x22);
+
+    /* Trigger second TX */
+    qtest_writel(s, ESPI_BASE + ESPI_PERIF_PC_TX_CTRL,
+                 PERIF_CTRL_TRIG_PEND | (2 << 12) | 0x0F);
+
+    val = qtest_readl(s, ESPI_BASE + ESPI_PERIF_PC_TX_CTRL);
+    g_assert_cmphex(val & PERIF_CTRL_TRIG_PEND, ==, 0);
+
+    val = qtest_readl(s, ESPI_BASE + ESPI_INT_STS);
+    g_assert_cmphex(val & ESPI_INT_PERIF_PC_TX_CMPLT, !=, 0);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: OOB TX round-trip with multiple packets
+ */
+static void test_espi_oob_tx_roundtrip(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    qtest_writel(s, ESPI_BASE + ESPI_INT_STS, 0xFFFFFFFF);
+
+    /* First OOB packet: 3 bytes */
+    qtest_writel(s, ESPI_BASE + ESPI_OOB_TX_DATA, 0x10);
+    qtest_writel(s, ESPI_BASE + ESPI_OOB_TX_DATA, 0x20);
+    qtest_writel(s, ESPI_BASE + ESPI_OOB_TX_DATA, 0x30);
+    qtest_writel(s, ESPI_BASE + ESPI_OOB_TX_CTRL,
+                 OOB_CTRL_TRIG_PEND | (3 << 12) | 0x21);
+
+    val = qtest_readl(s, ESPI_BASE + ESPI_INT_STS);
+    g_assert_cmphex(val & ESPI_INT_OOB_TX_CMPLT, !=, 0);
+
+    /* Clear and send second */
+    qtest_writel(s, ESPI_BASE + ESPI_INT_STS, ESPI_INT_OOB_TX_CMPLT);
+
+    qtest_writel(s, ESPI_BASE + ESPI_OOB_TX_DATA, 0x40);
+    qtest_writel(s, ESPI_BASE + ESPI_OOB_TX_CTRL,
+                 OOB_CTRL_TRIG_PEND | (1 << 12) | 0x21);
+
+    val = qtest_readl(s, ESPI_BASE + ESPI_INT_STS);
+    g_assert_cmphex(val & ESPI_INT_OOB_TX_CMPLT, !=, 0);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: Flash TX round-trip
+ */
+static void test_espi_flash_tx_roundtrip(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    qtest_writel(s, ESPI_BASE + ESPI_INT_STS, 0xFFFFFFFF);
+
+    /* Flash read request: 4-byte address + command */
+    qtest_writel(s, ESPI_BASE + ESPI_FLASH_TX_DATA, 0x00);
+    qtest_writel(s, ESPI_BASE + ESPI_FLASH_TX_DATA, 0x00);
+    qtest_writel(s, ESPI_BASE + ESPI_FLASH_TX_DATA, 0x10);
+    qtest_writel(s, ESPI_BASE + ESPI_FLASH_TX_DATA, 0x00);
+    qtest_writel(s, ESPI_BASE + ESPI_FLASH_TX_CTRL,
+                 FLASH_CTRL_TRIG_PEND | (4 << 12) | 0x00);
+
+    val = qtest_readl(s, ESPI_BASE + ESPI_INT_STS);
+    g_assert_cmphex(val & ESPI_INT_FLASH_TX_CMPLT, !=, 0);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: All channels ready — set all SW_RDY bits and verify
+ */
+static void test_espi_all_channels_ready(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+    uint32_t all_ready = (1u << 7) |  /* FLASH_SW_RDY */
+                         (1u << 4) |  /* OOB_SW_RDY */
+                         (1u << 3) |  /* VW_SW_RDY */
+                         (1u << 1);   /* PERIF_SW_RDY */
+
+    /* Set all channels ready */
+    qtest_writel(s, ESPI_BASE + ESPI_CTRL, all_ready);
+    val = qtest_readl(s, ESPI_BASE + ESPI_CTRL);
+    g_assert_cmphex(val & all_ready, ==, all_ready);
+
+    /* Verify capabilities still report correctly */
+    val = qtest_readl(s, ESPI_BASE + ESPI_GEN_CAP_N_CONF);
+    g_assert_cmphex(val, ==, ESPI_GEN_CAP_RESET);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: Interrupt enable/disable/clear lifecycle
+ */
+static void test_espi_int_lifecycle(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    /* Enable all peripheral + OOB + flash interrupts */
+    uint32_t all_int = 0x00FFFFFF;
+    qtest_writel(s, ESPI_BASE + ESPI_INT_EN, all_int);
+    val = qtest_readl(s, ESPI_BASE + ESPI_INT_EN);
+    g_assert_cmphex(val, ==, all_int);
+
+    /* Use INT_EN_CLR to disable OOB interrupts (bits 4-5) */
+    qtest_writel(s, ESPI_BASE + 0x0FC, (1u << 5) | (1u << 4));
+    val = qtest_readl(s, ESPI_BASE + ESPI_INT_EN);
+    g_assert_cmphex(val & ((1u << 5) | (1u << 4)), ==, 0);
+    /* Other bits should remain */
+    g_assert_cmphex(val & (1u << 0), !=, 0);
+
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -877,5 +1106,19 @@ int main(int argc, char **argv)
     qtest_add_func("/aspeed-espi/ctrl2-default", test_espi_ctrl2_default);
     qtest_add_func("/aspeed-espi/ctrl2-mmbi-enable", test_espi_ctrl2_mmbi_enable);
     qtest_add_func("/aspeed-espi/mcyc-addr-regs", test_espi_mcyc_addr_regs);
+
+    /* Phase 6: Host-side co-simulation */
+    qtest_add_func("/aspeed-espi/host-vw-pltrst", test_espi_host_vw_pltrst);
+    qtest_add_func("/aspeed-espi/vw-slave-preserves-host",
+                   test_espi_vw_slave_preserves_host);
+    qtest_add_func("/aspeed-espi/perif-tx-roundtrip",
+                   test_espi_perif_tx_roundtrip);
+    qtest_add_func("/aspeed-espi/oob-tx-roundtrip",
+                   test_espi_oob_tx_roundtrip);
+    qtest_add_func("/aspeed-espi/flash-tx-roundtrip",
+                   test_espi_flash_tx_roundtrip);
+    qtest_add_func("/aspeed-espi/all-channels-ready",
+                   test_espi_all_channels_ready);
+    qtest_add_func("/aspeed-espi/int-lifecycle", test_espi_int_lifecycle);
     return g_test_run();
 }

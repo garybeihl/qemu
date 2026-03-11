@@ -71,6 +71,23 @@ struct AspeedESPIState {
     uint8_t  flash_tx_buf[ASPEED_ESPI_FLASH_FIFO_SIZE];
     uint32_t flash_tx_len;
 
+    /* TX capture: saves last transmitted packet for host-side readback */
+    uint8_t  last_pc_tx[ASPEED_ESPI_PERIF_FIFO_SIZE];
+    uint32_t last_pc_tx_len;
+    uint32_t last_pc_tx_ctrl;
+
+    uint8_t  last_np_tx[ASPEED_ESPI_PERIF_FIFO_SIZE];
+    uint32_t last_np_tx_len;
+    uint32_t last_np_tx_ctrl;
+
+    uint8_t  last_oob_tx[ASPEED_ESPI_OOB_FIFO_SIZE];
+    uint32_t last_oob_tx_len;
+    uint32_t last_oob_tx_ctrl;
+
+    uint8_t  last_flash_tx[ASPEED_ESPI_FLASH_FIFO_SIZE];
+    uint32_t last_flash_tx_len;
+    uint32_t last_flash_tx_ctrl;
+
     /* DMA support */
     AddressSpace dma_as;
     MemoryRegion *dram_mr;
@@ -329,5 +346,12 @@ void aspeed_espi_oob_rx_inject(AspeedESPIState *s, uint8_t cyc,
 void aspeed_espi_flash_rx_inject(AspeedESPIState *s, uint8_t cyc,
                                   uint8_t tag, const uint8_t *data,
                                   uint32_t len);
+
+/*
+ * Inject host-driven Virtual Wire system events into the slave.
+ * Sets the host-driven bits in SYSEVT and triggers appropriate interrupts.
+ * This simulates the host changing VW signals (PLTRST#, sleep states, etc).
+ */
+void aspeed_espi_vw_inject(AspeedESPIState *s, uint32_t host_events);
 
 #endif /* ASPEED_ESPI_H */

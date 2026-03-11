@@ -5,12 +5,13 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Phases 1-5 implementation:
+ * Phases 1-6 implementation:
  *   Phase 1: Register skeleton + Virtual Wire channel (CH1)
  *   Phase 2: Peripheral channel (CH0) FIFO and DMA data paths
  *   Phase 3: OOB channel (CH2) FIFO and DMA data paths
  *   Phase 4: Flash channel (CH3) FIFO and DMA data paths
  *   Phase 5: MMBI (Memory-Mapped BMC Interface) registers
+ *   Phase 6: Host-side VW injection and TX capture for co-simulation
  *
  * Implements the AST2600 eSPI controller at register level, sufficient for
  * the OpenBMC aspeed-espi kernel driver to probe and initialize. Supports:
@@ -25,6 +26,8 @@
  *   - DMA transfers between device and guest DRAM
  *   - MMBI control, interrupt status/enable, and host RW pointer registers
  *   - CTRL2 with MMBI read/write disable and memory cycle address mapping
+ *   - Host-side VW event injection for co-simulation testing
+ *   - TX capture buffers for host-side readback of slave transmissions
  *   - Software reset for peripheral, OOB, and Flash channel FIFOs
  *
  * Reference:
@@ -175,17 +178,13 @@ static void aspeed_espi_flash_tx_reset(AspeedESPIState *s)
  */
 static void aspeed_espi_perif_pc_tx_complete(AspeedESPIState *s)
 {
-    if (s->regs[R_ESPI_CTRL] & ESPI_CTRL_PERIF_PC_TX_DMA_EN) {
-        /*
-         * DMA mode: data was written to guest DRAM by firmware.
-         * In a full two-sided model the master would read it;
-         * for now we just acknowledge the transfer.
-         */
+    /* Capture TX data for host-side readback */
+    s->last_pc_tx_ctrl = s->regs[R_ESPI_PERIF_PC_TX_CTRL];
+    if (!(s->regs[R_ESPI_CTRL] & ESPI_CTRL_PERIF_PC_TX_DMA_EN)) {
+        memcpy(s->last_pc_tx, s->pc_tx_buf, s->pc_tx_len);
+        s->last_pc_tx_len = s->pc_tx_len;
     } else {
-        /*
-         * FIFO mode: data is already in pc_tx_buf from DATA writes.
-         * Nothing to transfer in a single-sided model.
-         */
+        s->last_pc_tx_len = 0;
     }
 
     /* Clear TRIG_PEND to indicate TX is complete */
@@ -204,10 +203,13 @@ static void aspeed_espi_perif_pc_tx_complete(AspeedESPIState *s)
  */
 static void aspeed_espi_perif_np_tx_complete(AspeedESPIState *s)
 {
-    if (s->regs[R_ESPI_CTRL] & ESPI_CTRL_PERIF_NP_TX_DMA_EN) {
-        /* DMA mode: acknowledge transfer */
+    /* Capture NP TX data for host-side readback */
+    s->last_np_tx_ctrl = s->regs[R_ESPI_PERIF_NP_TX_CTRL];
+    if (!(s->regs[R_ESPI_CTRL] & ESPI_CTRL_PERIF_NP_TX_DMA_EN)) {
+        memcpy(s->last_np_tx, s->np_tx_buf, s->np_tx_len);
+        s->last_np_tx_len = s->np_tx_len;
     } else {
-        /* FIFO mode: data already in np_tx_buf */
+        s->last_np_tx_len = 0;
     }
 
     s->regs[R_ESPI_PERIF_NP_TX_CTRL] &= ~ESPI_PERIF_NP_TX_CTRL_TRIG_PEND;
@@ -223,10 +225,13 @@ static void aspeed_espi_perif_np_tx_complete(AspeedESPIState *s)
  */
 static void aspeed_espi_oob_tx_complete(AspeedESPIState *s)
 {
-    if (s->regs[R_ESPI_CTRL] & ESPI_CTRL_OOB_TX_DMA_EN) {
-        /* DMA mode: data was written to guest DRAM by firmware */
+    /* Capture OOB TX data for host-side readback */
+    s->last_oob_tx_ctrl = s->regs[R_ESPI_OOB_TX_CTRL];
+    if (!(s->regs[R_ESPI_CTRL] & ESPI_CTRL_OOB_TX_DMA_EN)) {
+        memcpy(s->last_oob_tx, s->oob_tx_buf, s->oob_tx_len);
+        s->last_oob_tx_len = s->oob_tx_len;
     } else {
-        /* FIFO mode: data is in oob_tx_buf from DATA writes */
+        s->last_oob_tx_len = 0;
     }
 
     s->regs[R_ESPI_OOB_TX_CTRL] &= ~ESPI_OOB_TX_CTRL_TRIG_PEND;
@@ -242,10 +247,13 @@ static void aspeed_espi_oob_tx_complete(AspeedESPIState *s)
  */
 static void aspeed_espi_flash_tx_complete(AspeedESPIState *s)
 {
-    if (s->regs[R_ESPI_CTRL] & ESPI_CTRL_FLASH_TX_DMA_EN) {
-        /* DMA mode: data was written to guest DRAM by firmware */
+    /* Capture Flash TX data for host-side readback */
+    s->last_flash_tx_ctrl = s->regs[R_ESPI_FLASH_TX_CTRL];
+    if (!(s->regs[R_ESPI_CTRL] & ESPI_CTRL_FLASH_TX_DMA_EN)) {
+        memcpy(s->last_flash_tx, s->flash_tx_buf, s->flash_tx_len);
+        s->last_flash_tx_len = s->flash_tx_len;
     } else {
-        /* FIFO mode: data is in flash_tx_buf from DATA writes */
+        s->last_flash_tx_len = 0;
     }
 
     s->regs[R_ESPI_FLASH_TX_CTRL] &= ~ESPI_FLASH_TX_CTRL_TRIG_PEND;
@@ -722,8 +730,8 @@ static void aspeed_espi_reset(DeviceState *dev)
 
 static const VMStateDescription vmstate_aspeed_espi = {
     .name = TYPE_ASPEED_ESPI,
-    .version_id = 4,
-    .minimum_version_id = 4,
+    .version_id = 5,
+    .minimum_version_id = 5,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, AspeedESPIState, ASPEED_ESPI_NR_REGS),
         VMSTATE_UINT8_ARRAY(pc_rx_buf, AspeedESPIState,
@@ -750,6 +758,23 @@ static const VMStateDescription vmstate_aspeed_espi = {
         VMSTATE_UINT8_ARRAY(flash_tx_buf, AspeedESPIState,
                             ASPEED_ESPI_FLASH_FIFO_SIZE),
         VMSTATE_UINT32(flash_tx_len, AspeedESPIState),
+        /* TX capture buffers */
+        VMSTATE_UINT8_ARRAY(last_pc_tx, AspeedESPIState,
+                            ASPEED_ESPI_PERIF_FIFO_SIZE),
+        VMSTATE_UINT32(last_pc_tx_len, AspeedESPIState),
+        VMSTATE_UINT32(last_pc_tx_ctrl, AspeedESPIState),
+        VMSTATE_UINT8_ARRAY(last_np_tx, AspeedESPIState,
+                            ASPEED_ESPI_PERIF_FIFO_SIZE),
+        VMSTATE_UINT32(last_np_tx_len, AspeedESPIState),
+        VMSTATE_UINT32(last_np_tx_ctrl, AspeedESPIState),
+        VMSTATE_UINT8_ARRAY(last_oob_tx, AspeedESPIState,
+                            ASPEED_ESPI_OOB_FIFO_SIZE),
+        VMSTATE_UINT32(last_oob_tx_len, AspeedESPIState),
+        VMSTATE_UINT32(last_oob_tx_ctrl, AspeedESPIState),
+        VMSTATE_UINT8_ARRAY(last_flash_tx, AspeedESPIState,
+                            ASPEED_ESPI_FLASH_FIFO_SIZE),
+        VMSTATE_UINT32(last_flash_tx_len, AspeedESPIState),
+        VMSTATE_UINT32(last_flash_tx_ctrl, AspeedESPIState),
         VMSTATE_END_OF_LIST(),
     },
 };
@@ -923,6 +948,29 @@ void aspeed_espi_flash_rx_inject(AspeedESPIState *s, uint8_t cyc,
 
     s->regs[R_ESPI_INT_STS] |= ESPI_INT_FLASH_RX_CMPLT;
     aspeed_espi_update_irq(s);
+}
+
+/*
+ * Inject host-driven Virtual Wire system events into the slave.
+ * This sets the host-driven bits in SYSEVT (PLTRST#, sleep states,
+ * HOST_RST_WARN, OOB_RST_WARN, SUSPEND) and triggers SYSEVT
+ * interrupts if the corresponding bits are enabled.
+ *
+ * Only host-driven bits (SYSEVT_HOST_DRIVEN_MASK) are modified;
+ * slave-driven bits are preserved.
+ */
+void aspeed_espi_vw_inject(AspeedESPIState *s, uint32_t host_events)
+{
+    uint32_t old_val = s->regs[R_ESPI_VW_SYSEVT];
+    uint32_t new_val;
+
+    /* Only modify host-driven bits, preserve slave-driven bits */
+    new_val = (host_events & SYSEVT_HOST_DRIVEN_MASK) |
+              (old_val & ~SYSEVT_HOST_DRIVEN_MASK);
+    s->regs[R_ESPI_VW_SYSEVT] = new_val;
+
+    /* Check if any changed bits should trigger interrupts */
+    aspeed_espi_vw_notify_sysevt(s, old_val, new_val);
 }
 
 DEFINE_TYPES(aspeed_espi_types)
