@@ -62,6 +62,26 @@
 #define ESPI_CTRL_OOB_TX_SW_RST (1u << 29)
 #define ESPI_CTRL_OOB_RX_SW_RST (1u << 28)
 
+
+/* Flash channel (CH3) register offsets - Phase 4 */
+#define ESPI_FLASH_RX_DMA       0x060
+#define ESPI_FLASH_RX_CTRL      0x064
+#define ESPI_FLASH_RX_DATA      0x068
+#define ESPI_FLASH_TX_DMA       0x070
+#define ESPI_FLASH_TX_CTRL      0x074
+#define ESPI_FLASH_TX_DATA      0x078
+
+/* Flash CTRL register bits */
+#define FLASH_CTRL_SERV_PEND    (1u << 31)
+#define FLASH_CTRL_TRIG_PEND    (1u << 31)
+
+/* Flash-related ESPI_CTRL bits */
+#define ESPI_CTRL_FLASH_TX_SW_RST  (1u << 31)
+#define ESPI_CTRL_FLASH_RX_SW_RST  (1u << 30)
+
+/* Flash interrupt bits */
+#define ESPI_INT_FLASH_TX_CMPLT (1u << 7)
+#define ESPI_INT_FLASH_RX_CMPLT (1u << 6)
 /* OOB interrupt bits */
 #define ESPI_INT_OOB_TX_CMPLT   (1u << 5)
 #define ESPI_INT_OOB_RX_CMPLT   (1u << 4)
@@ -503,6 +523,145 @@ static void test_espi_oob_tx_ctrl_trigger(void)
     qtest_quit(s);
 }
 
+/*
+ * ---- Phase 4: Flash Channel (CH3) Tests ----
+ */
+
+/*
+ * Test: Flash TX FIFO write + trigger generates TX completion interrupt
+ */
+static void test_espi_flash_tx_fifo(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    qtest_writel(s, ESPI_BASE + ESPI_INT_STS, 0xFFFFFFFF);
+
+    /* Write 4 bytes to Flash TX FIFO */
+    qtest_writel(s, ESPI_BASE + ESPI_FLASH_TX_DATA, 0x01);
+    qtest_writel(s, ESPI_BASE + ESPI_FLASH_TX_DATA, 0x02);
+    qtest_writel(s, ESPI_BASE + ESPI_FLASH_TX_DATA, 0x03);
+    qtest_writel(s, ESPI_BASE + ESPI_FLASH_TX_DATA, 0x04);
+
+    /* Trigger Flash TX: cycle=0x00 (flash read), tag=0, len=4, TRIG_PEND */
+    qtest_writel(s, ESPI_BASE + ESPI_FLASH_TX_CTRL,
+                 FLASH_CTRL_TRIG_PEND | (4 << 12) | 0x00);
+
+    /* TRIG_PEND should be cleared */
+    val = qtest_readl(s, ESPI_BASE + ESPI_FLASH_TX_CTRL);
+    g_assert_cmphex(val & FLASH_CTRL_TRIG_PEND, ==, 0);
+
+    /* Flash TX completion interrupt should be set */
+    val = qtest_readl(s, ESPI_BASE + ESPI_INT_STS);
+    g_assert_cmphex(val & ESPI_INT_FLASH_TX_CMPLT, !=, 0);
+
+    /* W1C to clear */
+    qtest_writel(s, ESPI_BASE + ESPI_INT_STS, ESPI_INT_FLASH_TX_CMPLT);
+    val = qtest_readl(s, ESPI_BASE + ESPI_INT_STS);
+    g_assert_cmphex(val & ESPI_INT_FLASH_TX_CMPLT, ==, 0);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: Flash RX CTRL SERV_PEND acknowledge path
+ */
+static void test_espi_flash_rx_ctrl(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    val = qtest_readl(s, ESPI_BASE + ESPI_FLASH_RX_CTRL);
+    g_assert_cmphex(val, ==, 0x00000000);
+
+    qtest_writel(s, ESPI_BASE + ESPI_FLASH_RX_CTRL, FLASH_CTRL_SERV_PEND);
+    val = qtest_readl(s, ESPI_BASE + ESPI_FLASH_RX_CTRL);
+    g_assert_cmphex(val & FLASH_CTRL_SERV_PEND, ==, 0);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: Flash DMA address registers are read-write
+ */
+static void test_espi_flash_dma_addr(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    qtest_writel(s, ESPI_BASE + ESPI_FLASH_RX_DMA, 0x80300000);
+    val = qtest_readl(s, ESPI_BASE + ESPI_FLASH_RX_DMA);
+    g_assert_cmphex(val, ==, 0x80300000);
+
+    qtest_writel(s, ESPI_BASE + ESPI_FLASH_TX_DMA, 0x80400000);
+    val = qtest_readl(s, ESPI_BASE + ESPI_FLASH_TX_DMA);
+    g_assert_cmphex(val, ==, 0x80400000);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: Flash SW reset clears FIFO state and is self-clearing
+ */
+static void test_espi_flash_sw_reset(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    qtest_writel(s, ESPI_BASE + ESPI_FLASH_TX_DATA, 0x55);
+
+    qtest_writel(s, ESPI_BASE + ESPI_CTRL, ESPI_CTRL_FLASH_TX_SW_RST);
+    val = qtest_readl(s, ESPI_BASE + ESPI_CTRL);
+    g_assert_cmphex(val & ESPI_CTRL_FLASH_TX_SW_RST, ==, 0);
+    val = qtest_readl(s, ESPI_BASE + ESPI_FLASH_TX_CTRL);
+    g_assert_cmphex(val, ==, 0x00000000);
+
+    qtest_writel(s, ESPI_BASE + ESPI_CTRL, ESPI_CTRL_FLASH_RX_SW_RST);
+    val = qtest_readl(s, ESPI_BASE + ESPI_CTRL);
+    g_assert_cmphex(val & ESPI_CTRL_FLASH_RX_SW_RST, ==, 0);
+    val = qtest_readl(s, ESPI_BASE + ESPI_FLASH_RX_CTRL);
+    g_assert_cmphex(val, ==, 0x00000000);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: Flash RX DATA is read-only from BMC side
+ */
+static void test_espi_flash_rx_data_readonly(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    qtest_writel(s, ESPI_BASE + ESPI_FLASH_RX_DATA, 0xDEADBEEF);
+    val = qtest_readl(s, ESPI_BASE + ESPI_FLASH_RX_DATA);
+    g_assert_cmphex(val, ==, 0x00000000);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: Flash TX CTRL trigger-pending completes immediately
+ */
+static void test_espi_flash_tx_ctrl_trigger(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    qtest_writel(s, ESPI_BASE + ESPI_INT_STS, 0xFFFFFFFF);
+
+    qtest_writel(s, ESPI_BASE + ESPI_FLASH_TX_CTRL,
+                 FLASH_CTRL_TRIG_PEND | (0 << 12) | 0x00);
+
+    val = qtest_readl(s, ESPI_BASE + ESPI_FLASH_TX_CTRL);
+    g_assert_cmphex(val & FLASH_CTRL_TRIG_PEND, ==, 0);
+
+    val = qtest_readl(s, ESPI_BASE + ESPI_INT_STS);
+    g_assert_cmphex(val & ESPI_INT_FLASH_TX_CMPLT, !=, 0);
+
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -535,5 +694,15 @@ int main(int argc, char **argv)
                    test_espi_oob_rx_data_readonly);
     qtest_add_func("/aspeed-espi/oob-tx-ctrl-trigger",
                    test_espi_oob_tx_ctrl_trigger);
+
+    /* Phase 4: Flash channel */
+    qtest_add_func("/aspeed-espi/flash-tx-fifo", test_espi_flash_tx_fifo);
+    qtest_add_func("/aspeed-espi/flash-rx-ctrl", test_espi_flash_rx_ctrl);
+    qtest_add_func("/aspeed-espi/flash-dma-addr", test_espi_flash_dma_addr);
+    qtest_add_func("/aspeed-espi/flash-sw-reset", test_espi_flash_sw_reset);
+    qtest_add_func("/aspeed-espi/flash-rx-data-readonly",
+                   test_espi_flash_rx_data_readonly);
+    qtest_add_func("/aspeed-espi/flash-tx-ctrl-trigger",
+                   test_espi_flash_tx_ctrl_trigger);
     return g_test_run();
 }

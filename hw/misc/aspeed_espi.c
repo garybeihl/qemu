@@ -5,10 +5,11 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Phases 1-3 implementation:
+ * Phases 1-4 implementation:
  *   Phase 1: Register skeleton + Virtual Wire channel (CH1)
  *   Phase 2: Peripheral channel (CH0) FIFO and DMA data paths
  *   Phase 3: OOB channel (CH2) FIFO and DMA data paths
+ *   Phase 4: Flash channel (CH3) FIFO and DMA data paths
  *
  * Implements the AST2600 eSPI controller at register level, sufficient for
  * the OpenBMC aspeed-espi kernel driver to probe and initialize. Supports:
@@ -19,8 +20,9 @@
  *   - Peripheral channel (CH0) FIFO-based TX/RX for posted completions
  *   - Peripheral channel non-posted TX path
  *   - OOB channel (CH2) FIFO-based TX/RX for out-of-band messages
+ *   - Flash channel (CH3) FIFO-based TX/RX for flash access
  *   - DMA transfers between device and guest DRAM
- *   - Software reset for peripheral and OOB channel FIFOs
+ *   - Software reset for peripheral, OOB, and Flash channel FIFOs
  *
  * Reference:
  *   - Intel eSPI Base Specification Rev 1.0
@@ -146,6 +148,23 @@ static void aspeed_espi_oob_tx_reset(AspeedESPIState *s)
     s->regs[R_ESPI_OOB_TX_CTRL] = 0;
 }
 
+/* ---- Flash channel (CH3) helpers ---- */
+
+static void aspeed_espi_flash_rx_reset(AspeedESPIState *s)
+{
+    memset(s->flash_rx_buf, 0, sizeof(s->flash_rx_buf));
+    s->flash_rx_len = 0;
+    s->flash_rx_pos = 0;
+    s->regs[R_ESPI_FLASH_RX_CTRL] = 0;
+}
+
+static void aspeed_espi_flash_tx_reset(AspeedESPIState *s)
+{
+    memset(s->flash_tx_buf, 0, sizeof(s->flash_tx_buf));
+    s->flash_tx_len = 0;
+    s->regs[R_ESPI_FLASH_TX_CTRL] = 0;
+}
+
 
 /*
  * Complete a PC TX operation: transfer data via DMA or FIFO,
@@ -214,6 +233,25 @@ static void aspeed_espi_oob_tx_complete(AspeedESPIState *s)
     aspeed_espi_update_irq(s);
 }
 
+/*
+ * Complete a Flash TX operation: transfer data via DMA or FIFO,
+ * clear TRIG_PEND, and raise TX completion interrupt.
+ */
+static void aspeed_espi_flash_tx_complete(AspeedESPIState *s)
+{
+    if (s->regs[R_ESPI_CTRL] & ESPI_CTRL_FLASH_TX_DMA_EN) {
+        /* DMA mode: data was written to guest DRAM by firmware */
+    } else {
+        /* FIFO mode: data is in flash_tx_buf from DATA writes */
+    }
+
+    s->regs[R_ESPI_FLASH_TX_CTRL] &= ~ESPI_FLASH_TX_CTRL_TRIG_PEND;
+    s->flash_tx_len = 0;
+
+    s->regs[R_ESPI_INT_STS] |= ESPI_INT_FLASH_TX_CMPLT;
+    aspeed_espi_update_irq(s);
+}
+
 
 static uint64_t aspeed_espi_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -250,6 +288,17 @@ static uint64_t aspeed_espi_read(void *opaque, hwaddr offset, unsigned size)
         }
         if (s->oob_rx_pos < s->oob_rx_len) {
             byte_val = s->oob_rx_buf[s->oob_rx_pos++];
+            return byte_val;
+        }
+        return 0;
+
+    case R_ESPI_FLASH_RX_DATA:
+        /* Flash RX: same FIFO/DMA pattern */
+        if (s->regs[R_ESPI_CTRL] & ESPI_CTRL_FLASH_RX_DMA_EN) {
+            return 0;
+        }
+        if (s->flash_rx_pos < s->flash_rx_len) {
+            byte_val = s->flash_rx_buf[s->flash_rx_pos++];
             return byte_val;
         }
         return 0;
@@ -294,6 +343,12 @@ static void aspeed_espi_write(void *opaque, hwaddr offset, uint64_t data,
         }
         if (data & ESPI_CTRL_OOB_TX_SW_RST) {
             aspeed_espi_oob_tx_reset(s);
+        }
+        if (data & ESPI_CTRL_FLASH_RX_SW_RST) {
+            aspeed_espi_flash_rx_reset(s);
+        }
+        if (data & ESPI_CTRL_FLASH_TX_SW_RST) {
+            aspeed_espi_flash_tx_reset(s);
         }
         s->regs[R_ESPI_CTRL] = data & ~(
             ESPI_CTRL_FLASH_TX_SW_RST |
@@ -498,6 +553,42 @@ static void aspeed_espi_write(void *opaque, hwaddr offset, uint64_t data,
         }
         break;
 
+    /* Flash channel (CH3) registers */
+    case R_ESPI_FLASH_RX_DMA:
+    case R_ESPI_FLASH_TX_DMA:
+        s->regs[reg] = (uint32_t)data;
+        break;
+
+    case R_ESPI_FLASH_RX_CTRL:
+        if (data & ESPI_FLASH_RX_CTRL_SERV_PEND) {
+            s->regs[R_ESPI_FLASH_RX_CTRL] &=
+                ~ESPI_FLASH_RX_CTRL_SERV_PEND;
+            s->flash_rx_pos = 0;
+            s->flash_rx_len = 0;
+        }
+        break;
+
+    case R_ESPI_FLASH_TX_CTRL:
+        s->regs[R_ESPI_FLASH_TX_CTRL] = (uint32_t)data;
+        if (data & ESPI_FLASH_TX_CTRL_TRIG_PEND) {
+            aspeed_espi_flash_tx_complete(s);
+        }
+        break;
+
+    case R_ESPI_FLASH_RX_DATA:
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: Write to read-only Flash RX DATA register\n",
+                      __func__);
+        break;
+
+    case R_ESPI_FLASH_TX_DATA:
+        if (!(s->regs[R_ESPI_CTRL] & ESPI_CTRL_FLASH_TX_DMA_EN)) {
+            if (s->flash_tx_len < ASPEED_ESPI_FLASH_FIFO_SIZE) {
+                s->flash_tx_buf[s->flash_tx_len++] = (uint8_t)data;
+            }
+        }
+        break;
+
     case R_ESPI_GEN_CAP_N_CONF:
     case R_ESPI_CH0_CAP_N_CONF:
     case R_ESPI_CH1_CAP_N_CONF:
@@ -586,12 +677,16 @@ static void aspeed_espi_reset(DeviceState *dev)
     /* Reset OOB channel FIFO state */
     aspeed_espi_oob_rx_reset(s);
     aspeed_espi_oob_tx_reset(s);
+
+    /* Reset Flash channel FIFO state */
+    aspeed_espi_flash_rx_reset(s);
+    aspeed_espi_flash_tx_reset(s);
 }
 
 static const VMStateDescription vmstate_aspeed_espi = {
     .name = TYPE_ASPEED_ESPI,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, AspeedESPIState, ASPEED_ESPI_NR_REGS),
         VMSTATE_UINT8_ARRAY(pc_rx_buf, AspeedESPIState,
@@ -611,6 +706,13 @@ static const VMStateDescription vmstate_aspeed_espi = {
         VMSTATE_UINT8_ARRAY(oob_tx_buf, AspeedESPIState,
                             ASPEED_ESPI_OOB_FIFO_SIZE),
         VMSTATE_UINT32(oob_tx_len, AspeedESPIState),
+        VMSTATE_UINT8_ARRAY(flash_rx_buf, AspeedESPIState,
+                            ASPEED_ESPI_FLASH_FIFO_SIZE),
+        VMSTATE_UINT32(flash_rx_len, AspeedESPIState),
+        VMSTATE_UINT32(flash_rx_pos, AspeedESPIState),
+        VMSTATE_UINT8_ARRAY(flash_tx_buf, AspeedESPIState,
+                            ASPEED_ESPI_FLASH_FIFO_SIZE),
+        VMSTATE_UINT32(flash_tx_len, AspeedESPIState),
         VMSTATE_END_OF_LIST(),
     },
 };
@@ -738,6 +840,51 @@ void aspeed_espi_oob_rx_inject(AspeedESPIState *s, uint8_t cyc,
 
     /* Raise OOB RX completion interrupt */
     s->regs[R_ESPI_INT_STS] |= ESPI_INT_OOB_RX_CMPLT;
+    aspeed_espi_update_irq(s);
+}
+
+/*
+ * Inject a Flash RX packet into the Flash channel.
+ * This simulates a host-to-BMC flash read response arriving over eSPI.
+ *
+ * In FIFO mode, data is placed in the internal Flash RX buffer.
+ * In DMA mode, data is written directly to guest DRAM.
+ */
+void aspeed_espi_flash_rx_inject(AspeedESPIState *s, uint8_t cyc,
+                                  uint8_t tag, const uint8_t *data,
+                                  uint32_t len)
+{
+    uint32_t i;
+
+    if (len > ASPEED_ESPI_FLASH_FIFO_SIZE) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: Flash packet too large (%u > %u)\n",
+                      __func__, len, ASPEED_ESPI_FLASH_FIFO_SIZE);
+        len = ASPEED_ESPI_FLASH_FIFO_SIZE;
+    }
+
+    if (s->regs[R_ESPI_CTRL] & ESPI_CTRL_FLASH_RX_DMA_EN) {
+        if (s->dram_mr) {
+            uint32_t dma_addr = s->regs[R_ESPI_FLASH_RX_DMA];
+            for (i = 0; i < len; i++) {
+                address_space_stb(&s->dma_as,
+                                  dma_addr + i,
+                                  data[i],
+                                  MEMTXATTRS_UNSPECIFIED,
+                                  NULL);
+            }
+        }
+    } else {
+        memcpy(s->flash_rx_buf, data, len);
+        s->flash_rx_len = len;
+        s->flash_rx_pos = 0;
+    }
+
+    s->regs[R_ESPI_FLASH_RX_CTRL] =
+        ESPI_FLASH_RX_CTRL_SERV_PEND |
+        espi_perif_ctrl_pack(cyc, tag, len);
+
+    s->regs[R_ESPI_INT_STS] |= ESPI_INT_FLASH_RX_CMPLT;
     aspeed_espi_update_irq(s);
 }
 
