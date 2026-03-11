@@ -25,6 +25,9 @@
 /* Maximum payload size for peripheral channel FIFO (bytes) */
 #define ASPEED_ESPI_PERIF_FIFO_SIZE  256
 
+/* Maximum payload size for OOB channel FIFO (bytes) */
+#define ASPEED_ESPI_OOB_FIFO_SIZE    256
+
 #define TYPE_ASPEED_ESPI "aspeed.espi"
 OBJECT_DECLARE_SIMPLE_TYPE(AspeedESPIState, ASPEED_ESPI)
 
@@ -48,6 +51,14 @@ struct AspeedESPIState {
 
     uint8_t  np_tx_buf[ASPEED_ESPI_PERIF_FIFO_SIZE];
     uint32_t np_tx_len;
+
+    /* OOB channel (CH2) FIFO buffers */
+    uint8_t  oob_rx_buf[ASPEED_ESPI_OOB_FIFO_SIZE];
+    uint32_t oob_rx_len;
+    uint32_t oob_rx_pos;
+
+    uint8_t  oob_tx_buf[ASPEED_ESPI_OOB_FIFO_SIZE];
+    uint32_t oob_tx_len;
 
     /* DMA support */
     AddressSpace dma_as;
@@ -79,6 +90,10 @@ struct AspeedESPIState {
 #define ESPI_PERIF_PC_TX_CTRL_TRIG_PEND   BIT(31)
 #define ESPI_PERIF_NP_TX_CTRL_TRIG_PEND   BIT(31)
 
+/* OOB channel CTRL register bit definitions */
+#define ESPI_OOB_RX_CTRL_SERV_PEND        BIT(31)
+#define ESPI_OOB_TX_CTRL_TRIG_PEND        BIT(31)
+
 /* CTRL register field masks and shifts */
 #define ESPI_PERIF_CTRL_LEN_MASK     0x00FFF000
 #define ESPI_PERIF_CTRL_LEN_SHIFT    12
@@ -86,6 +101,14 @@ struct AspeedESPIState {
 #define ESPI_PERIF_CTRL_TAG_SHIFT    8
 #define ESPI_PERIF_CTRL_CYC_MASK     0x000000FF
 #define ESPI_PERIF_CTRL_CYC_SHIFT    0
+
+/* OOB CTRL register field masks (same layout as peripheral channel) */
+#define ESPI_OOB_CTRL_LEN_MASK       0x00FFF000
+#define ESPI_OOB_CTRL_LEN_SHIFT      12
+#define ESPI_OOB_CTRL_TAG_MASK       0x00000F00
+#define ESPI_OOB_CTRL_TAG_SHIFT      8
+#define ESPI_OOB_CTRL_CYC_MASK       0x000000FF
+#define ESPI_OOB_CTRL_CYC_SHIFT      0
 
 /* OOB channel (CH2) - Phase 3 */
 #define R_ESPI_OOB_RX_DMA      (0x040 / 4)
@@ -238,5 +261,13 @@ struct AspeedESPIState {
 void aspeed_espi_perif_pc_rx_inject(AspeedESPIState *s, uint8_t cyc,
                                      uint8_t tag, const uint8_t *data,
                                      uint32_t len);
+
+/*
+ * Inject an OOB channel RX packet (simulates host-to-BMC OOB message).
+ * Used by QTest and potentially by a future host-side eSPI master model.
+ */
+void aspeed_espi_oob_rx_inject(AspeedESPIState *s, uint8_t cyc,
+                                uint8_t tag, const uint8_t *data,
+                                uint32_t len);
 
 #endif /* ASPEED_ESPI_H */

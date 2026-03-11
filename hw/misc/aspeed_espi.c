@@ -5,9 +5,10 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Phase 1+2 implementation:
+ * Phases 1-3 implementation:
  *   Phase 1: Register skeleton + Virtual Wire channel (CH1)
  *   Phase 2: Peripheral channel (CH0) FIFO and DMA data paths
+ *   Phase 3: OOB channel (CH2) FIFO and DMA data paths
  *
  * Implements the AST2600 eSPI controller at register level, sufficient for
  * the OpenBMC aspeed-espi kernel driver to probe and initialize. Supports:
@@ -17,8 +18,9 @@
  *   - Channel capability and configuration reporting
  *   - Peripheral channel (CH0) FIFO-based TX/RX for posted completions
  *   - Peripheral channel non-posted TX path
+ *   - OOB channel (CH2) FIFO-based TX/RX for out-of-band messages
  *   - DMA transfers between device and guest DRAM
- *   - Software reset for peripheral channel FIFOs
+ *   - Software reset for peripheral and OOB channel FIFOs
  *
  * Reference:
  *   - Intel eSPI Base Specification Rev 1.0
@@ -127,6 +129,24 @@ static void aspeed_espi_perif_np_tx_reset(AspeedESPIState *s)
     s->regs[R_ESPI_PERIF_NP_TX_CTRL] = 0;
 }
 
+/* ---- OOB channel (CH2) helpers ---- */
+
+static void aspeed_espi_oob_rx_reset(AspeedESPIState *s)
+{
+    memset(s->oob_rx_buf, 0, sizeof(s->oob_rx_buf));
+    s->oob_rx_len = 0;
+    s->oob_rx_pos = 0;
+    s->regs[R_ESPI_OOB_RX_CTRL] = 0;
+}
+
+static void aspeed_espi_oob_tx_reset(AspeedESPIState *s)
+{
+    memset(s->oob_tx_buf, 0, sizeof(s->oob_tx_buf));
+    s->oob_tx_len = 0;
+    s->regs[R_ESPI_OOB_TX_CTRL] = 0;
+}
+
+
 /*
  * Complete a PC TX operation: transfer data via DMA or FIFO,
  * clear TRIG_PEND, and raise TX completion interrupt.
@@ -175,6 +195,25 @@ static void aspeed_espi_perif_np_tx_complete(AspeedESPIState *s)
     aspeed_espi_update_irq(s);
 }
 
+/*
+ * Complete an OOB TX operation: transfer data via DMA or FIFO,
+ * clear TRIG_PEND, and raise TX completion interrupt.
+ */
+static void aspeed_espi_oob_tx_complete(AspeedESPIState *s)
+{
+    if (s->regs[R_ESPI_CTRL] & ESPI_CTRL_OOB_TX_DMA_EN) {
+        /* DMA mode: data was written to guest DRAM by firmware */
+    } else {
+        /* FIFO mode: data is in oob_tx_buf from DATA writes */
+    }
+
+    s->regs[R_ESPI_OOB_TX_CTRL] &= ~ESPI_OOB_TX_CTRL_TRIG_PEND;
+    s->oob_tx_len = 0;
+
+    s->regs[R_ESPI_INT_STS] |= ESPI_INT_OOB_TX_CMPLT;
+    aspeed_espi_update_irq(s);
+}
+
 
 static uint64_t aspeed_espi_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -200,6 +239,17 @@ static uint64_t aspeed_espi_read(void *opaque, hwaddr offset, unsigned size)
         }
         if (s->pc_rx_pos < s->pc_rx_len) {
             byte_val = s->pc_rx_buf[s->pc_rx_pos++];
+            return byte_val;
+        }
+        return 0;
+
+    case R_ESPI_OOB_RX_DATA:
+        /* OOB RX: same FIFO/DMA pattern as peripheral channel */
+        if (s->regs[R_ESPI_CTRL] & ESPI_CTRL_OOB_RX_DMA_EN) {
+            return 0;
+        }
+        if (s->oob_rx_pos < s->oob_rx_len) {
+            byte_val = s->oob_rx_buf[s->oob_rx_pos++];
             return byte_val;
         }
         return 0;
@@ -238,6 +288,12 @@ static void aspeed_espi_write(void *opaque, hwaddr offset, uint64_t data,
         }
         if (data & ESPI_CTRL_PERIF_NP_TX_SW_RST) {
             aspeed_espi_perif_np_tx_reset(s);
+        }
+        if (data & ESPI_CTRL_OOB_RX_SW_RST) {
+            aspeed_espi_oob_rx_reset(s);
+        }
+        if (data & ESPI_CTRL_OOB_TX_SW_RST) {
+            aspeed_espi_oob_tx_reset(s);
         }
         s->regs[R_ESPI_CTRL] = data & ~(
             ESPI_CTRL_FLASH_TX_SW_RST |
@@ -392,6 +448,56 @@ static void aspeed_espi_write(void *opaque, hwaddr offset, uint64_t data,
         }
         break;
 
+    /* OOB channel (CH2) registers */
+    case R_ESPI_OOB_RX_DMA:
+    case R_ESPI_OOB_TX_DMA:
+        /* DMA address registers: store the guest physical address */
+        s->regs[reg] = (uint32_t)data;
+        break;
+
+    case R_ESPI_OOB_RX_CTRL:
+        /*
+         * BMC writes SERV_PEND to acknowledge receipt of an OOB packet.
+         * This clears the pending flag and resets the RX FIFO position.
+         */
+        if (data & ESPI_OOB_RX_CTRL_SERV_PEND) {
+            s->regs[R_ESPI_OOB_RX_CTRL] &= ~ESPI_OOB_RX_CTRL_SERV_PEND;
+            s->oob_rx_pos = 0;
+            s->oob_rx_len = 0;
+        }
+        break;
+
+    case R_ESPI_OOB_TX_CTRL:
+        /*
+         * BMC writes CYC|TAG|LEN|TRIG_PEND to trigger an OOB TX.
+         * Store the control word, then if TRIG_PEND is set,
+         * complete the transmission.
+         */
+        s->regs[R_ESPI_OOB_TX_CTRL] = (uint32_t)data;
+        if (data & ESPI_OOB_TX_CTRL_TRIG_PEND) {
+            aspeed_espi_oob_tx_complete(s);
+        }
+        break;
+
+    case R_ESPI_OOB_RX_DATA:
+        /* OOB RX DATA is read-only from BMC side */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: Write to read-only OOB RX DATA register\n",
+                      __func__);
+        break;
+
+    case R_ESPI_OOB_TX_DATA:
+        /*
+         * FIFO mode: BMC pushes bytes into OOB TX buffer.
+         * DMA mode: writes are ignored (data comes from DRAM).
+         */
+        if (!(s->regs[R_ESPI_CTRL] & ESPI_CTRL_OOB_TX_DMA_EN)) {
+            if (s->oob_tx_len < ASPEED_ESPI_OOB_FIFO_SIZE) {
+                s->oob_tx_buf[s->oob_tx_len++] = (uint8_t)data;
+            }
+        }
+        break;
+
     case R_ESPI_GEN_CAP_N_CONF:
     case R_ESPI_CH0_CAP_N_CONF:
     case R_ESPI_CH1_CAP_N_CONF:
@@ -476,12 +582,16 @@ static void aspeed_espi_reset(DeviceState *dev)
     aspeed_espi_perif_pc_rx_reset(s);
     aspeed_espi_perif_pc_tx_reset(s);
     aspeed_espi_perif_np_tx_reset(s);
+
+    /* Reset OOB channel FIFO state */
+    aspeed_espi_oob_rx_reset(s);
+    aspeed_espi_oob_tx_reset(s);
 }
 
 static const VMStateDescription vmstate_aspeed_espi = {
     .name = TYPE_ASPEED_ESPI,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, AspeedESPIState, ASPEED_ESPI_NR_REGS),
         VMSTATE_UINT8_ARRAY(pc_rx_buf, AspeedESPIState,
@@ -494,6 +604,13 @@ static const VMStateDescription vmstate_aspeed_espi = {
         VMSTATE_UINT8_ARRAY(np_tx_buf, AspeedESPIState,
                             ASPEED_ESPI_PERIF_FIFO_SIZE),
         VMSTATE_UINT32(np_tx_len, AspeedESPIState),
+        VMSTATE_UINT8_ARRAY(oob_rx_buf, AspeedESPIState,
+                            ASPEED_ESPI_OOB_FIFO_SIZE),
+        VMSTATE_UINT32(oob_rx_len, AspeedESPIState),
+        VMSTATE_UINT32(oob_rx_pos, AspeedESPIState),
+        VMSTATE_UINT8_ARRAY(oob_tx_buf, AspeedESPIState,
+                            ASPEED_ESPI_OOB_FIFO_SIZE),
+        VMSTATE_UINT32(oob_tx_len, AspeedESPIState),
         VMSTATE_END_OF_LIST(),
     },
 };
@@ -571,6 +688,56 @@ void aspeed_espi_perif_pc_rx_inject(AspeedESPIState *s, uint8_t cyc,
 
     /* Raise RX completion interrupt */
     s->regs[R_ESPI_INT_STS] |= ESPI_INT_PERIF_PC_RX_CMPLT;
+    aspeed_espi_update_irq(s);
+}
+
+/*
+ * Inject an OOB RX packet into the OOB channel.
+ * This simulates a host-to-BMC OOB message arriving over the eSPI bus.
+ *
+ * In FIFO mode, data is placed in the internal OOB RX buffer.
+ * In DMA mode, data is written directly to guest DRAM at the
+ * address specified in OOB_RX_DMA.
+ */
+void aspeed_espi_oob_rx_inject(AspeedESPIState *s, uint8_t cyc,
+                                uint8_t tag, const uint8_t *data,
+                                uint32_t len)
+{
+    uint32_t i;
+
+    if (len > ASPEED_ESPI_OOB_FIFO_SIZE) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: OOB packet too large (%u > %u)\n",
+                      __func__, len, ASPEED_ESPI_OOB_FIFO_SIZE);
+        len = ASPEED_ESPI_OOB_FIFO_SIZE;
+    }
+
+    if (s->regs[R_ESPI_CTRL] & ESPI_CTRL_OOB_RX_DMA_EN) {
+        /* DMA mode: write data to guest DRAM */
+        if (s->dram_mr) {
+            uint32_t dma_addr = s->regs[R_ESPI_OOB_RX_DMA];
+            for (i = 0; i < len; i++) {
+                address_space_stb(&s->dma_as,
+                                  dma_addr + i,
+                                  data[i],
+                                  MEMTXATTRS_UNSPECIFIED,
+                                  NULL);
+            }
+        }
+    } else {
+        /* FIFO mode: copy data into OOB RX buffer */
+        memcpy(s->oob_rx_buf, data, len);
+        s->oob_rx_len = len;
+        s->oob_rx_pos = 0;
+    }
+
+    /* Set CTRL with packet header and SERV_PEND flag */
+    s->regs[R_ESPI_OOB_RX_CTRL] =
+        ESPI_OOB_RX_CTRL_SERV_PEND |
+        espi_perif_ctrl_pack(cyc, tag, len);
+
+    /* Raise OOB RX completion interrupt */
+    s->regs[R_ESPI_INT_STS] |= ESPI_INT_OOB_RX_CMPLT;
     aspeed_espi_update_irq(s);
 }
 

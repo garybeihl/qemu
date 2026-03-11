@@ -45,6 +45,26 @@
 #define ESPI_INT_PERIF_PC_TX_CMPLT (1u << 1)
 #define ESPI_INT_PERIF_NP_TX_CMPLT (1u << 3)
 
+
+/* OOB channel (CH2) register offsets - Phase 3 */
+#define ESPI_OOB_RX_DMA         0x040
+#define ESPI_OOB_RX_CTRL        0x044
+#define ESPI_OOB_RX_DATA        0x048
+#define ESPI_OOB_TX_DMA         0x050
+#define ESPI_OOB_TX_CTRL        0x054
+#define ESPI_OOB_TX_DATA        0x058
+
+/* OOB CTRL register bits */
+#define OOB_CTRL_SERV_PEND      (1u << 31)
+#define OOB_CTRL_TRIG_PEND      (1u << 31)
+
+/* OOB-related ESPI_CTRL bits */
+#define ESPI_CTRL_OOB_TX_SW_RST (1u << 29)
+#define ESPI_CTRL_OOB_RX_SW_RST (1u << 28)
+
+/* OOB interrupt bits */
+#define ESPI_INT_OOB_TX_CMPLT   (1u << 5)
+#define ESPI_INT_OOB_RX_CMPLT   (1u << 4)
 /* Expected reset values */
 #define ESPI_GEN_CAP_RESET      0x0000F759
 #define ESPI_INT_STS_RESET      0x80000000  /* RST_DEASSERT */
@@ -324,6 +344,165 @@ static void test_espi_perif_rx_data_readonly(void)
     qtest_quit(s);
 }
 
+/*
+ * ---- Phase 3: OOB Channel (CH2) Tests ----
+ */
+
+/*
+ * Test: OOB TX FIFO write + trigger generates TX completion interrupt
+ */
+static void test_espi_oob_tx_fifo(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    /* Clear any pending interrupts */
+    qtest_writel(s, ESPI_BASE + ESPI_INT_STS, 0xFFFFFFFF);
+
+    /* Write 4 bytes to OOB TX FIFO */
+    qtest_writel(s, ESPI_BASE + ESPI_OOB_TX_DATA, 0xAA);
+    qtest_writel(s, ESPI_BASE + ESPI_OOB_TX_DATA, 0xBB);
+    qtest_writel(s, ESPI_BASE + ESPI_OOB_TX_DATA, 0xCC);
+    qtest_writel(s, ESPI_BASE + ESPI_OOB_TX_DATA, 0xDD);
+
+    /* Trigger OOB TX: cycle=0x21 (OOB message), tag=0, len=4, TRIG_PEND */
+    qtest_writel(s, ESPI_BASE + ESPI_OOB_TX_CTRL,
+                 OOB_CTRL_TRIG_PEND | (4 << 12) | 0x21);
+
+    /* TRIG_PEND should be cleared after completion */
+    val = qtest_readl(s, ESPI_BASE + ESPI_OOB_TX_CTRL);
+    g_assert_cmphex(val & OOB_CTRL_TRIG_PEND, ==, 0);
+
+    /* OOB TX completion interrupt should be set */
+    val = qtest_readl(s, ESPI_BASE + ESPI_INT_STS);
+    g_assert_cmphex(val & ESPI_INT_OOB_TX_CMPLT, !=, 0);
+
+    /* W1C to clear it */
+    qtest_writel(s, ESPI_BASE + ESPI_INT_STS, ESPI_INT_OOB_TX_CMPLT);
+    val = qtest_readl(s, ESPI_BASE + ESPI_INT_STS);
+    g_assert_cmphex(val & ESPI_INT_OOB_TX_CMPLT, ==, 0);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: OOB RX CTRL SERV_PEND acknowledge path
+ */
+static void test_espi_oob_rx_ctrl(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    /* RX CTRL should start at 0 (no pending packet) */
+    val = qtest_readl(s, ESPI_BASE + ESPI_OOB_RX_CTRL);
+    g_assert_cmphex(val, ==, 0x00000000);
+
+    /* Writing SERV_PEND to acknowledge (when nothing pending) is a no-op */
+    qtest_writel(s, ESPI_BASE + ESPI_OOB_RX_CTRL, OOB_CTRL_SERV_PEND);
+    val = qtest_readl(s, ESPI_BASE + ESPI_OOB_RX_CTRL);
+    g_assert_cmphex(val & OOB_CTRL_SERV_PEND, ==, 0);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: OOB DMA address registers are read-write
+ */
+static void test_espi_oob_dma_addr(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    /* OOB RX DMA address */
+    qtest_writel(s, ESPI_BASE + ESPI_OOB_RX_DMA, 0x80100000);
+    val = qtest_readl(s, ESPI_BASE + ESPI_OOB_RX_DMA);
+    g_assert_cmphex(val, ==, 0x80100000);
+
+    /* OOB TX DMA address */
+    qtest_writel(s, ESPI_BASE + ESPI_OOB_TX_DMA, 0x80200000);
+    val = qtest_readl(s, ESPI_BASE + ESPI_OOB_TX_DMA);
+    g_assert_cmphex(val, ==, 0x80200000);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: OOB SW reset clears FIFO state and is self-clearing
+ */
+static void test_espi_oob_sw_reset(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    /* Write some data into OOB TX FIFO */
+    qtest_writel(s, ESPI_BASE + ESPI_OOB_TX_DATA, 0x11);
+    qtest_writel(s, ESPI_BASE + ESPI_OOB_TX_DATA, 0x22);
+
+    /* Assert OOB TX SW reset via CTRL register */
+    qtest_writel(s, ESPI_BASE + ESPI_CTRL, ESPI_CTRL_OOB_TX_SW_RST);
+
+    /* SW reset bit should be self-clearing */
+    val = qtest_readl(s, ESPI_BASE + ESPI_CTRL);
+    g_assert_cmphex(val & ESPI_CTRL_OOB_TX_SW_RST, ==, 0);
+
+    /* TX CTRL should be cleared by reset */
+    val = qtest_readl(s, ESPI_BASE + ESPI_OOB_TX_CTRL);
+    g_assert_cmphex(val, ==, 0x00000000);
+
+    /* Same for OOB RX reset */
+    qtest_writel(s, ESPI_BASE + ESPI_CTRL, ESPI_CTRL_OOB_RX_SW_RST);
+    val = qtest_readl(s, ESPI_BASE + ESPI_CTRL);
+    g_assert_cmphex(val & ESPI_CTRL_OOB_RX_SW_RST, ==, 0);
+    val = qtest_readl(s, ESPI_BASE + ESPI_OOB_RX_CTRL);
+    g_assert_cmphex(val, ==, 0x00000000);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: OOB RX DATA is read-only from BMC side (writes ignored)
+ */
+static void test_espi_oob_rx_data_readonly(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    /* Write to OOB RX DATA should be rejected */
+    qtest_writel(s, ESPI_BASE + ESPI_OOB_RX_DATA, 0xDEADBEEF);
+
+    /* Reading should return 0 (empty FIFO) */
+    val = qtest_readl(s, ESPI_BASE + ESPI_OOB_RX_DATA);
+    g_assert_cmphex(val, ==, 0x00000000);
+
+    qtest_quit(s);
+}
+
+/*
+ * Test: OOB TX CTRL trigger-pending completes immediately
+ */
+static void test_espi_oob_tx_ctrl_trigger(void)
+{
+    QTestState *s = qtest_init(AST2600_MACHINE);
+    uint32_t val;
+
+    /* Clear interrupts */
+    qtest_writel(s, ESPI_BASE + ESPI_INT_STS, 0xFFFFFFFF);
+
+    /* Trigger with TRIG_PEND and zero-length header */
+    qtest_writel(s, ESPI_BASE + ESPI_OOB_TX_CTRL,
+                 OOB_CTRL_TRIG_PEND | (0 << 12) | 0x21);
+
+    /* TRIG_PEND should clear */
+    val = qtest_readl(s, ESPI_BASE + ESPI_OOB_TX_CTRL);
+    g_assert_cmphex(val & OOB_CTRL_TRIG_PEND, ==, 0);
+
+    /* TX completion interrupt should fire */
+    val = qtest_readl(s, ESPI_BASE + ESPI_INT_STS);
+    g_assert_cmphex(val & ESPI_INT_OOB_TX_CMPLT, !=, 0);
+
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -346,5 +525,15 @@ int main(int argc, char **argv)
     qtest_add_func("/aspeed-espi/perif-rx-data-readonly",
                    test_espi_perif_rx_data_readonly);
 
+
+    /* Phase 3: OOB channel */
+    qtest_add_func("/aspeed-espi/oob-tx-fifo", test_espi_oob_tx_fifo);
+    qtest_add_func("/aspeed-espi/oob-rx-ctrl", test_espi_oob_rx_ctrl);
+    qtest_add_func("/aspeed-espi/oob-dma-addr", test_espi_oob_dma_addr);
+    qtest_add_func("/aspeed-espi/oob-sw-reset", test_espi_oob_sw_reset);
+    qtest_add_func("/aspeed-espi/oob-rx-data-readonly",
+                   test_espi_oob_rx_data_readonly);
+    qtest_add_func("/aspeed-espi/oob-tx-ctrl-trigger",
+                   test_espi_oob_tx_ctrl_trigger);
     return g_test_run();
 }
