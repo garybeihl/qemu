@@ -1,7 +1,7 @@
 /*
  * ASPEED AST2600 eSPI Controller
  *
- * Copyright (c) 2024
+ * Copyright (c) 2024 Microsoft Corporation
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *

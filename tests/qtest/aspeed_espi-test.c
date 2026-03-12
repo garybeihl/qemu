@@ -2,7 +2,7 @@
  * QTest testcase for the Aspeed AST2600 eSPI Controller
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
- * Copyright (c) 2026 Gary Beihl <garybeihl@microsoft.com>
+ * Copyright (c) 2026 Microsoft Corporation
  */
 
 #include "qemu/osdep.h"
